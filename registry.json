@@ -5,9 +5,9 @@
       "id": "oai-basispoints",
       "name": "CPA OpenAI Basis Points",
       "description": "通过现有 ChatGPT/Codex OAuth 接入 Basis Points，提供 Responses、图片附件及客户端工具协议适配。",
-      "author": "JaxsonWang",
-      "repository": "https://github.com/JaxsonWang/cpa-plugin-oai-basispoints",
-      "homepage": "https://github.com/JaxsonWang/cpa-plugin-oai-basispoints",
+      "author": "Fourgetu",
+      "repository": "https://github.com/Fourgetu/cpa-plugin-oai-basispoints",
+      "homepage": "https://github.com/Fourgetu/cpa-plugin-oai-basispoints",
       "tags": [
         "Provider",
         "Codex",

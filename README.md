@@ -1,5 +1,6 @@
 # CPA OpenAI Basis Points 插件
 
+> 本仓库是 [Fourgetu](https://github.com/Fourgetu) 的 fork：基线为上游 v0.1.14，版本号 `0.1.14-pro.1`。相对上游的改动、分流条件与取舍见 [FORK-NOTES.md](FORK-NOTES.md)，更新日志见 [CHANGELOG.md](CHANGELOG.md)。上游代码、MIT 许可证与版权声明原样保留。
 这是一个 CLIProxyAPI（CPA）原生插件，用 CPA 已有的 ChatGPT/Codex OAuth 凭据直接请求。
 
 ## 通过 CPA 插件商店安装（推荐）
@@ -7,7 +8,7 @@
 在管理界面的「第三方插件源 → 插件源 registry URL (plugins.store-sources)」中添加以下地址并保存，然后刷新插件商店，搜索 **CPA OpenAI Basis Points**：
 
 ```text
-https://raw.githubusercontent.com/JaxsonWang/cpa-plugin-oai-basispoints/main/registry.json
+https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/v0.1.14-pro.1/registry.json
 ```
 
 也可合并到 CPA **宿主配置**（`config.yaml`，与下方插件配置共用同一个 `plugins` 节点）：
@@ -16,7 +17,7 @@ https://raw.githubusercontent.com/JaxsonWang/cpa-plugin-oai-basispoints/main/reg
 plugins:
   enabled: true
   store-sources:
-    - https://raw.githubusercontent.com/JaxsonWang/cpa-plugin-oai-basispoints/main/registry.json
+    - https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/v0.1.14-pro.1/registry.json
 ```
 
 保留已有插件源，不要整体覆盖原有 `plugins` 配置；内置官方源由 CPA 自动保留。本源使用宿主原生的 `github-release` 安装方式，最新版本以本仓库已发布的 GitHub Release 为准，不在 registry 中另行维护版本号。CPA 会按运行平台下载 `oai-basispoints_<version>_<goos>_<goarch>.zip`，并使用同一 Release 的 `checksums.txt` 校验。
@@ -45,6 +46,10 @@ make build
 - `turn_id` 按会话和当前用户 turn 稳定生成；工具结果回合只递增 `agent_iteration`，不会把同一 turn 重新当成新计划。
 - 工具中继通过外层 `references: [完整工具名]` 路由，`code` 只承载该工具的载荷：function 工具为参数 JSON 对象，custom 工具为逐字保留的原始文本。不要再套 `{tool,args}` 内层包装；插件不执行其中代码。已有会话的原生历史调用原样回放，新调用按本次注入的协议生成。
 - 非法函数 JSON、目录外工具或不符合 schema 的参数仍严格拒绝，最多重新生成一次，失败返回 422；不猜测修补引号、不丢弃坏调用，也不将失败响应部分交付。
+- 工具条目 id：custom 调用使用 `ctc_` 前缀，历史里残留的错误前缀按条目类型自动纠偏（否则上游会以 400 拒绝整段历史）。
+- 协议错误内联交付：以流内 `response.failed`（非流式 `status=failed`、HTTP 200）返回，不做 5xx 让 CPA 冷却凭据。
+- 原生 Responses 客户端（`Format == "openai-response"`）走增量流式：文本到达即下发、工具事件扣留到终态校验后合成、上游安静时每 15s 发送 SSE 保活注释；`codex` 等其它格式仍走全量缓冲 + 最多重生成一次。
+- `code` 参数声明为 string 的函数工具支持"原始代码直传"：`summary` 放 `codex2api.function_code/<工具名>` 形态标记，`code` 放源码原文，其余参数作为一个 JSON 对象放在 `extended_summary`（没有该标记时一律按普通函数形状解析 `code`）。
 - 未能从 OAuth JWT 或凭据字段得到账号 ID、token 过期、上游返回非 2xx、工具名不在客户端目录中时，插件会报告明确错误，不伪造成功。
 
 ---

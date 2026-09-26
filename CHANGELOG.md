@@ -1,5 +1,16 @@
 # 更新日志
 
+## v0.1.14-pro.1 — 2026-09-26（fork，未发布）
+
+本分支是 [Fourgetu/cpa-plugin-oai-basispoints](https://github.com/Fourgetu/cpa-plugin-oai-basispoints) 的 `prod/v0.1.14` 分支：上游 v0.1.14 + 五处生产环境验证过的改动。版本号沿用"上游版本 + `-pro.N`"，与 tag 一致。
+
+- **基线跟进到上游 v0.1.14**：采纳上游的新信封（`references` 路由 + `code` 只放载荷、custom 原文直传）与 message 流式的 `content_part.*` 事件修复；删除我们此前的 `codex2api.custom/` 私有标记（改用上游信封的 `references` 路由判别形态）。
+- custom 工具调用使用 `ctc_` 前缀的条目 id；历史里残留的错误前缀按条目类型统一纠偏（上游仍未处理，一条坏历史会让整段对话每次请求 400）。
+- 中转载荷本身写坏时不再整条判废：原生 Responses 客户端路径把原生条目原样放行（客户端会回 `unsupported call`，下一轮被换成重发提示 + 类别级诊断）；放行条目同样参与 `call_id` 唯一性校验；其它路径仍走上游"最多重生成一次"。
+- 协议错误内联交付（流内 `response.failed`、非流式 `status=failed`，HTTP 200），不再以 5xx 交给 CPA，避免账号被冷却。
+- 原生 Responses 客户端（`Format == "openai-response"`）改走增量流式桥：文本事件到达即下发、工具事件扣留到终态校验后从权威条目合成、上游安静时每 15s 发送 SSE 保活注释；`codex` 等其它格式保留上游的"全量缓冲 + 最多重生成一次"。
+- `code` 参数声明为 string 的函数工具（如 `mcp__cua_repl.js`）支持"原始代码直传"：`summary` 放 `codex2api.function_code/<工具名>` 形态标记，源码原文进 `code`，其余参数作为一个 JSON 对象进 `extended_summary`（约定沿用 hloolx/codex2api，经 ranxi2001/sub2api 的 BPS 协议包对照）。形态判别只看 `summary` 标记：上游自己的 `extended_summary` 是自然语言调用摘要、模型几乎每条调用都会写，拿"它能不能解析成 JSON 对象"当判据会把普通调用误判成这种形态（custom 工具的参数会被悄悄丢掉）；标记指向的工具必须是声明了 string `code` 的函数工具，否则按契约冲突报错。
+
 ## v0.1.14 — 2026-09-26（UTC+8）
 
 - 修复 #11，并延续 #6/#4 的工具中继治理：移除不必要的内层 `{tool,args}` JSON 封装，工具名由外层 `references` 唯一指定；custom 正文直接放入 `code`，保留引号、反斜杠、换行及空白。

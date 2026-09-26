@@ -144,6 +144,16 @@ func (s *Service) execute(raw json.RawMessage, stream bool) (any, error) {
 	}
 	payload, response, headers, err := s.executeResponse(request, body, credential, false)
 	if err != nil {
+		// 原生 Responses 客户端的本地协议问题按内联失败交付：HTTP 200 + status=failed。
+		// 交给 CPA 当 5xx 会把账号冷却，后续请求一起 503。
+		if request.Format == openAIResponseFormat {
+			if protocolErr, ok := asProtocolError(err); ok {
+				return map[string]any{
+					"Payload": failureResponseBody("", protocolFailureCode(err), protocolErr.Message),
+					"Headers": http.Header{"Content-Type": {"application/json"}},
+				}, nil
+			}
+		}
 		return nil, err
 	}
 	if request.Format == "codex" {
@@ -214,6 +224,12 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, cr
 	if request.StreamID == "" {
 		return nil, fail(500, "stream_id_missing", "executor.execute_stream requires stream_id")
 	}
+
+	// 原生 Responses 客户端走增量桥：文本实时下发、工具事件扣留到终态校验、上游安静时保活。
+	// 其它格式（codex 等，由 CPA 从 Claude/Codex 请求翻译而来）保留上游的全量缓冲 + 重生成路径。
+	if request.Format == openAIResponseFormat {
+		return s.executeStreamIncremental(request, body, credential)
+	}
 	// 宿主 stream.close 只接受错误字符串；先验证再返回，保留 RPC HTTP 状态。
 	_, response, _, err := s.executeResponse(request, body, credential, true)
 	if err != nil {
@@ -255,8 +271,8 @@ func registration(cfg Config) map[string]any {
 		"metadata": map[string]any{
 			"Name":             "OpenAI Basis Points",
 			"Version":          Version,
-			"Author":           "jaxson-wang",
-			"GitHubRepository": "https://github.com/JaxsonWang/cpa-plugin-oai-basispoints",
+			"Author":           "Fourgetu",
+			"GitHubRepository": "https://github.com/Fourgetu/cpa-plugin-oai-basispoints",
 			"Description":      "CPA Responses adapter for bps.openai.com with safe client-tool relay",
 			"ConfigFields": []map[string]any{
 				{"Name": "responses_url", "Type": "string", "Description": "Basis Points Responses endpoint."},
@@ -307,4 +323,81 @@ func unmarshalYAML(raw []byte, value any) error {
 	// Kept in one function so config parsing is easy to test and the service
 	// package does not expose YAML details to the ABI layer.
 	return yaml.Unmarshal(raw, value)
+}
+
+// executeStreamIncremental 把上游 SSE 直接桥接给客户端：
+// 文本等事件到达即下发，工具事件扣留到终态校验后再从权威条目合成，
+// 上游安静期间按 streamKeepaliveInterval 发 SSE 注释保活。
+// 只对原生 Responses 客户端启用；其它格式仍走全量缓冲 + 重生成路径。
+func (s *Service) executeStreamIncremental(request ExecutorRequest, body map[string]any, credential credential) (any, error) {
+	source, err := executorSource(request)
+	if err != nil {
+		return nil, err
+	}
+	upstream, err := s.upstreamStream(request, body, credential)
+	if err != nil {
+		return nil, err
+	}
+	go func() {
+		// 宿主 stream.close 只接受错误字符串；nil 表示干净收尾。
+		closeWithError := func(err error) {
+			payload := map[string]any{"stream_id": request.StreamID}
+			if err != nil {
+				payload["error"] = err.Error()
+			}
+			_ = s.call("host.stream.close", payload, nil)
+		}
+		// 本地协议问题：以流内 response.failed 交付并干净关闭流，
+		// 不让 CPA 看到插件错误（否则账号会被冷却）。
+		emitFailure := func(code, message string) {
+			payload := map[string]any{"stream_id": request.StreamID, "payload": syntheticFailureStream("", code, message)}
+			if emitErr := s.call("host.stream.emit", payload, nil); emitErr != nil {
+				closeWithError(fail(499, "client_disconnected", "client disconnected while receiving stream"))
+				return
+			}
+			closeWithError(nil)
+		}
+		bridge := newToolStreamBridge(func(payload []byte) error {
+			if len(payload) == 0 {
+				return nil
+			}
+			return s.call("host.stream.emit", map[string]any{"stream_id": request.StreamID, "payload": payload}, nil)
+		}, source)
+		stopKeepalive := bridge.startKeepalive()
+		streamErr := s.consumeUpstreamStream(upstream, bridge.handleEvent)
+		stopKeepalive()
+		if streamErr == nil {
+			if terminal, _ := bridge.state(); !terminal {
+				streamErr = failProtocol("basispoints_invalid_response", "Basis Points stream ended without response.completed")
+			}
+		}
+		if streamErr == nil {
+			closeWithError(nil)
+			return
+		}
+		if errors.Is(streamErr, errStreamEmitFailed) {
+			closeWithError(fail(499, "client_disconnected", "client disconnected while receiving stream"))
+			return
+		}
+		terminal, wrote := bridge.state()
+		if terminal {
+			// 终态已经下发：这一轮已经交付完毕，之后的读取错误（上游断流、超时）
+			// 只能收尾，绝不能再补一个终态事件。
+			closeWithError(nil)
+			return
+		}
+		if protocolErr, ok := asProtocolError(streamErr); ok {
+			emitFailure(protocolFailureCode(streamErr), protocolErr.Message)
+			return
+		}
+		if wrote {
+			// 已经下发过真实内容：这一轮不再判成账号/传输故障（CPA 会把 5xx 记到账号上）。
+			emitFailure(streamFailureCode(streamErr), safeError(streamErr))
+			return
+		}
+		// 一个字节的真实内容都没下发过（保活注释不算）：按传输故障收尾，
+		// 让 CPA 可以把这个账号判为故障并换一个凭据重试。
+		closeWithError(streamErr)
+	}()
+	return map[string]any{"Headers": map[string][]string{"Content-Type": {"text/event-stream"}, "Cache-Control": {"no-cache"}}}, nil
 }

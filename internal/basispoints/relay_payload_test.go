@@ -53,7 +53,7 @@ func TestRelayPayloadAvoidsNestedJSON(t *testing.T) {
 					t.Fatal("function payload changed")
 				}
 			}
-			replay := fallbackTransportCall(call)
+			replay := fallbackTransportCall(call, clientToolSpecs(source)["tools.invoke"])
 			outer := parseArguments(replay["arguments"])
 			if !reflect.DeepEqual(outer["references"], []any{"tools.invoke"}) {
 				t.Fatal("history lost tool routing")

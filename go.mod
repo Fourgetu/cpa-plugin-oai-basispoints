@@ -1,4 +1,4 @@
-module github.com/jaxson-wang/cpa-plugin-oai-basispoints
+module github.com/Fourgetu/cpa-plugin-oai-basispoints
 
 go 1.26.0
 

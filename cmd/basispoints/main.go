@@ -71,7 +71,7 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/jaxson-wang/cpa-plugin-oai-basispoints/internal/basispoints"
+	"github.com/Fourgetu/cpa-plugin-oai-basispoints/internal/basispoints"
 )
 
 const abiVersion = 1

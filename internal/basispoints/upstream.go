@@ -170,6 +170,47 @@ func (s *Service) readUpstreamStream(stream upstreamStream) ([]byte, error) {
 	}
 }
 
+// consumeUpstreamStream 边读边把上游 SSE 事件交给 handler：
+// 不再把整轮响应收进缓冲区，否则长回合里下游长时间零字节 → Cloudflare 524 / 客户端"一直转圈"。
+// handler 返回错误即停止读取并关闭上游流。
+func (s *Service) consumeUpstreamStream(stream upstreamStream, handler func(event string, data []byte) error) error {
+	cfg := s.config()
+	if stream.StreamID == "" {
+		return fail(502, "upstream_transport", "upstream stream ID is empty")
+	}
+	defer func() { _ = s.call("host.http.stream_close", map[string]any{"stream_id": stream.StreamID}, nil) }()
+	decoder := newSSEDecoder()
+	deadline := time.Now().Add(time.Duration(cfg.TimeoutSeconds) * time.Second)
+	total := 0
+	for {
+		if time.Now().After(deadline) {
+			return timeoutError(cfg)
+		}
+		var chunk streamChunk
+		if err := s.call("host.http.stream_read", map[string]any{"stream_id": stream.StreamID}, &chunk); err != nil {
+			return fail(502, "upstream_transport", "Basis Points stream read failed: "+safeError(err))
+		}
+		if chunk.Error != "" {
+			return fail(502, "upstream_transport", "Basis Points stream interrupted: "+safeError(errors.New(chunk.Error)))
+		}
+		if len(chunk.Payload) > 0 {
+			total += len(chunk.Payload)
+			if total > cfg.MaxResponseBytes {
+				return fail(502, "upstream_response_too_large", "Basis Points response exceeds configured limit")
+			}
+			// 只把解出来的完整事件交出去；单个事件可能跨 chunk。
+			if err := decoder.feed(chunk.Payload, func(event, data string) error {
+				return handler(event, []byte(data))
+			}); err != nil {
+				return err
+			}
+		}
+		if chunk.Done {
+			return nil
+		}
+	}
+}
+
 type sseDecoder struct {
 	buffer strings.Builder
 	data   []string

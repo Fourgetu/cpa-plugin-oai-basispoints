@@ -2,6 +2,7 @@ package basispoints
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"net/http"
@@ -10,7 +11,7 @@ import (
 )
 
 const (
-	Version        = "0.1.12"
+	Version        = "0.1.12-pro.1"
 	Provider       = "oai-basispoints"
 	AuthProviderID = "codex"
 	PluginID       = Provider
@@ -18,7 +19,43 @@ const (
 	DefaultResponsesURL  = "https://bps.openai.com/basispoints/api/responses"
 	DefaultUpstreamModel = "gpt-6-astra"
 	DefaultModelID       = "gpt-6-astra-basispoints"
+
+	// openAIResponseFormat 是 CPA 交给原生 Responses 客户端（Codex Desktop、Excel 加载项）
+	// 的输出格式；codex 等其它格式是 CPA 从 Claude/Codex 请求翻译而来的。
+	openAIResponseFormat = "openai-response"
 )
+
+// failProtocol 描述"这一轮无法按客户端协议交付"的本地问题：上游返回的工具调用与客户端目录
+// 对不上、条目结构畸形、流没有正常收尾等。它不是账号或凭据故障，因此不能作为 5xx 交给 CPA
+// ——那会让 CPA 把账号判为故障并冷却，之后同一账号的所有请求一起撞 503。
+// 422 与上游 relayError 同码：CPA 不会因此冷却凭据，由服务层决定是否内联交付。
+func failProtocol(code, message string) error {
+	return fail(422, code, message)
+}
+
+// asProtocolError 判断错误是不是本地协议问题（而不是账号、传输或上游故障）。
+// 只有白名单里的类别才算：未知类别一律保留上游的硬错误行为，避免把真实故障内联化。
+func asProtocolError(err error) (*APIError, bool) {
+	var apiError *APIError
+	if !errors.As(err, &apiError) || apiError == nil || apiError.Status != 422 {
+		return nil, false
+	}
+	switch apiError.Kind {
+	case "invalid_tool_call", "basispoints_protocol_error", "basispoints_invalid_response",
+		"basispoints_stream_incomplete", "basispoints_stream_error":
+		return apiError, true
+	}
+	return nil, false
+}
+
+// protocolFailureCode 给内联失败选错误码（协议错误自身带的类别优先）。
+func protocolFailureCode(err error) string {
+	var apiError *APIError
+	if errors.As(err, &apiError) && apiError != nil && strings.TrimSpace(apiError.Kind) != "" {
+		return apiError.Kind
+	}
+	return "basispoints_protocol_error"
+}
 
 var supportedReasoningEfforts = map[string]struct{}{
 	"low": {}, "medium": {}, "high": {}, "xhigh": {}, "ultra": {},

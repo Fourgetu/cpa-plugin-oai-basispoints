@@ -95,7 +95,12 @@ func TestClientToolIdentityAndReplay(t *testing.T) {
 				t.Fatalf("transform: changed=%t err=%v", changed, err)
 			}
 			call := objectValue(response["output"].([]any)[0])
-			if call["type"] != itemType || call["name"] != tc.name || stringValue(call["namespace"]) != tc.namespace || call["call_id"] != native["call_id"] || call["id"] != native["id"] {
+			// custom 条目必须换成 ctc_ 前缀的 id：上游按条目类型校验，沿用原生 fc_ 会让后续请求 400。
+			wantID := native["id"]
+			if tc.kind == "custom" {
+				wantID = customItemID(stringValue(native["call_id"]))
+			}
+			if call["type"] != itemType || call["name"] != tc.name || stringValue(call["namespace"]) != tc.namespace || call["call_id"] != native["call_id"] || call["id"] != wantID {
 				t.Fatalf("client identity changed: %#v", call)
 			}
 			if tc.namespace == "" {

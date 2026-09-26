@@ -1,5 +1,16 @@
 # 更新日志
 
+## v0.1.12-pro.1 — 2026-09-26（fork，未发布）
+
+本分支是 [Fourgetu/cpa-plugin-oai-basispoints](https://github.com/Fourgetu/cpa-plugin-oai-basispoints) 的 `prod/v0.1.12` 分支：上游 v0.1.12 + 生产环境已上线验证过的修复。版本号沿用上游版本加 `-pro.N` 后缀，与 tag `v0.1.12-pro.1` 一致。除本节条目外，其余行为与上游 v0.1.12 一致。
+
+- custom 工具调用使用 `ctc_` 前缀的条目 id；历史里残留的错误前缀（custom 条目带 `fc_`）按条目类型统一纠偏，避免一条坏历史让整段对话每次请求都 400。
+- custom 工具支持"原始文本直传"标记 `codex2api.custom/<目录工具名>`：补丁/脚本正文里的裸引号、反斜杠、多行内容不必再做二次转义（嵌套 JSON 被写坏正是上游返回畸形工具调用的根因）。
+- custom「原始文本直传」之外，再支持 `code` 参数是字符串的函数工具（如 REPL/解释器类工具）走 `codex2api.function_code/<目录键>`：源码原文进 `code`，其余参数作为一个 JSON 对象进 `extended_summary`，源码不必二次转义；历史回放同样按这个形状重建（约定沿用 hloolx/codex2api，经 ranxi2001/sub2api 的 BPS 协议包对照）。
+- 中转载荷本身写坏时不再整条判废：原生 Responses 客户端路径把原生条目原样放行（客户端会回 `unsupported call`，下一轮被换成重发提示 + 类别级诊断）；其它路径仍返回协议错误，以便上游"最多重生成一次"。
+- 协议错误内联交付（流内 `response.failed`、非流式 `status=failed`，HTTP 200），不再以 5xx 交给 CPA，避免账号被冷却后形成 503 墙。
+- 原生 Responses 客户端（Codex Desktop、Excel 加载项，CPA 传 `Format == openai-response`）改走增量流式桥：文本事件到达即下发、工具事件扣留到终态校验后从权威条目合成、上游安静时每 15s 发送 SSE 保活注释，解决长回合被 Cloudflare 524 / 客户端"一直转圈"。`codex` 等其它格式保留上游的"全量缓冲 + 最多重生成一次"路径。
+
 ## v0.1.12 — 2026-09-25（UTC+8）
 
 - 仅修改插件：声明 CPA 已有的 `codex` 输入/输出格式，复用宿主 Claude↔Codex 转换；不新增私有转换器，不修改 CPA 主程序。

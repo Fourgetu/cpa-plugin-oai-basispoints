@@ -1,7 +1,7 @@
-# Fourgetu fork 说明（分支 `prod/v0.1.14`，版本 `0.1.14-pro.1`）
+# Fourgetu fork 说明（分支 `prod/v0.1.14`，版本 `0.1.14-pro.2`）
 
 本仓库是 [JaxsonWang/cpa-plugin-oai-basispoints](https://github.com/JaxsonWang/cpa-plugin-oai-basispoints) 的 fork，发布在 [Fourgetu/cpa-plugin-oai-basispoints](https://github.com/Fourgetu/cpa-plugin-oai-basispoints)。
-分支 `prod/v0.1.14` 以上游 **v0.1.14**（commit `1b9359a`）为基线，版本号 `0.1.14-pro.1`（与 tag 一致），在上游之上只保留五处生产环境验证过的改动。
+分支 `prod/v0.1.14` 以上游 **v0.1.14**（commit `1b9359a`）为基线，版本号 `0.1.14-pro.2`（与 tag 一致），在上游之上只保留五处生产环境验证过的改动，外加一组有界的工具封装纠错（对齐 ranxi2001/sub2api v2.8.15）。
 
 除本文列出的差异外，其余行为与 v0.1.14 一致；上游代码、MIT 许可证与版权声明原样保留。
 
@@ -49,8 +49,11 @@ if request.Format == "openai-response" { 增量桥 } else { 上游 buffered + �
 原生 Responses 客户端（Codex Desktop、Excel 加载项）取值 `openai-response`；`codex` 是 CPA 从 Claude/Codex 请求翻译而来的格式。
 因此增量桥命中真实客户端，而 codex/Claude 路径保留上游语义（它们没有 `unsupported call` 自愈通道）。
 
-## 5. 两种"畸形中转"策略
+## 5. 畸形中转的三条路径
 
+终态校验失败时按下面顺序处理（严格路径与放行路径都走 `transformResponseBodyWith`）：
+
+- 纠错路径（本分支新增，只有原生 Responses 增量桥走这条）：整批都是可识别的 `run_officejs` 调用、外层参数本身合法、只是载荷写坏时，先把"这一批没有被执行"（`executed: false` + 类别级诊断）回灌给模型，再用同一凭据/会话最多追问两次；成功后用纠正后的条目顶替扣留的位置（正文不重放、响应身份与 `output` 索引不变、各次追问的用量累加）；两次都救不回来就回落到下面的放行路径。目录外目标、重复 `call_id`、外层参数解不出来、条数异常一律不纠错。这套边界借自 ranxi2001/sub2api v2.8.15（PR #96）。
 `transformResponseBody`（严格）与 `transformResponseBodyPassThrough`（放行）都调用 `transformResponseBodyWith`：
 
 - 严格路径：畸形载荷返回协议错误（`422 invalid_tool_call`），由 `executeResponse` 用上游的"最多重生成一次 + 重发提示"
@@ -84,3 +87,4 @@ docker run --rm -v "$PWD":/src -w /src golang:1.26 sh -c '
   严格路径下它会被拒并重生成一次；原生 Responses 路径下会被原样放行、由客户端回 `unsupported call` 后自愈。
 - 上游 v0.1.12 及更早的历史在 `prod/v0.1.12` 分支保留，便于对比与回退。
 - 形态标记占用 `summary` 字段：这类调用的摘要显示的是标记串而不是自然语言（与 codex2api/sub2api 的约定一致，便于双方回放彼此写下的历史）。
+- **纠错成本**：封装纠错最多向 BPS 追问两次（同凭据、同会话），每次追问的用量都会累加进最终响应；只有"整批可识别但载荷写坏"这一小节才触发，正常回合不受影响。

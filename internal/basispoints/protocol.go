@@ -1342,14 +1342,20 @@ func functionCodeArguments(spec toolSpec, arguments map[string]any) (map[string]
 
 // syntheticFailureStream 生成"以内联失败结束"的 SSE 流。
 // 上游给不出可用结果时用它正常收尾：客户端看到 response.failed，
-// 而 CPA 看到的是 200 SSE，不会把账号判为故障。
-func syntheticFailureStream(responseID, code, message string) []byte {
+// 而 CPA 看到的是 200 SSE，不会把账号判为故障。terminal 非空时沿用它的 id/model/usage。
+func syntheticFailureStream(terminal map[string]any, responseID, code, message string) []byte {
 	base := map[string]any{
 		"id":         failureResponseID(responseID),
 		"object":     "response",
 		"created_at": time.Now().Unix(),
 		"status":     "in_progress",
 		"output":     []any{},
+	}
+	// 失败回合尽量沿用上游终态的身份与用量：客户端与计费仍能看到真实的响应与消耗。
+	for _, field := range []string{"id", "model", "usage"} {
+		if value := terminal[field]; value != nil {
+			base[field] = value
+		}
 	}
 	var builder strings.Builder
 	sequence := 0
@@ -1467,17 +1473,20 @@ func streamFailureCode(err error) string {
 }
 
 // toolStreamBridge 把上游 SSE 逐事件转成客户端 SSE（文本实时、工具扣留到终态）。
+// toolStreamBridge 把上游 SSE 逐事件转成客户端 SSE（文本实时、工具扣留到终态）。
 type toolStreamBridge struct {
-	mu        sync.Mutex
-	writeMu   sync.Mutex
-	emitFn    func([]byte) error
-	source    map[string]any
-	sequence  int
-	emitted   map[string]bool
-	pending   map[string]bool
-	terminal  bool
-	wrote     bool
-	keepalive time.Duration
+	mu               sync.Mutex
+	writeMu          sync.Mutex
+	emitFn           func([]byte) error
+	source           map[string]any
+	sequence         int
+	emitted          map[string]bool
+	pending          map[string]bool
+	terminal         bool
+	wrote            bool
+	keepalive        time.Duration
+	repair           toolRepairFunc
+	terminalResponse map[string]any
 }
 
 func newToolStreamBridge(emitFn func([]byte) error, source map[string]any) *toolStreamBridge {
@@ -1645,6 +1654,9 @@ func (b *toolStreamBridge) completeResponse(payload map[string]any) error {
 	if response == nil {
 		return failProtocol("basispoints_invalid_response", "Basis Points completed event is missing its response")
 	}
+	b.mu.Lock()
+	b.terminalResponse = response
+	b.mu.Unlock()
 	output, _ := response["output"].([]any)
 	b.mu.Lock()
 	for _, value := range output {
@@ -1658,7 +1670,7 @@ func (b *toolStreamBridge) completeResponse(payload map[string]any) error {
 		// 终态缺少扣留的原生条目：宁可整轮失败，也不把不完整/未知的工具交给客户端执行。
 		return failProtocol("basispoints_protocol_error", "Basis Points completed response omitted an original tool item")
 	}
-	_, transformed, _, err := transformResponseBodyPassThrough(jsonBytes(response), b.source)
+	transformed, err := b.transformedTerminal(response)
 	if err != nil {
 		return err
 	}
@@ -1728,4 +1740,344 @@ func (b *toolStreamBridge) emitToolItems(response map[string]any) error {
 		}
 	}
 	return nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 工具封装纠错：借 ranxi2001/sub2api v2.8.15（PR #96）的边界，按本插件的信封形态落地。
+// 整批中转调用都还没执行、外层参数本身合法、只是载荷写坏时，最多追问两次让模型只修封装；
+// 成功就用纠正后的工具条目顶替扣留的位置；两次都救不回来就回落到原有的"原样放行 + 下一轮自愈"。
+// ─────────────────────────────────────────────────────────────────────────────
+
+// maxToolRepairs 与 sub2api 的 maxToolRepairs 对齐：最多两次纠正请求。
+const maxToolRepairs = 2
+
+// toolRepairFeedbackCode 是回灌给模型的失败原因码。
+const toolRepairFeedbackCode = "invalid_client_tool_transport"
+
+// toolRepairHint 是纠错追问里给模型的指令：只讲封装格式，不解释代码、不推断目标。
+const toolRepairHint = "The preceding tool batch failed transport validation before any client tool was executed. Correct only its transport formatting: return exactly %d run_officejs calls, in the same order, for the same client tools, preserving the intended operations and any raw payload byte for byte. Route with outer references containing exactly one catalog tool name and put only that tool's payload in code (a JSON arguments object for function tools, unchanged raw input for custom tools). For a function tool whose catalog line says its code parameter carries source text, also set summary to that tool's codex2api.function_code marker and put its other arguments as one JSON object in extended_summary. Do not execute Office code, do not add operations, do not repeat commentary."
+
+// toolRepairFunc 用同一凭据、同一会话再向 BPS 要一次修正结果；此时整个工具批次仍未执行。
+type toolRepairFunc func(response map[string]any, validation error) (map[string]any, error)
+
+// transportTargetName 取外层参数声明的目标工具：function_code 标记优先，其次是 references。
+func transportTargetName(arguments map[string]any) string {
+	if marked, present := functionCodeMarkedTool(arguments); present {
+		return marked
+	}
+	if references, ok := arguments["references"].([]any); ok && len(references) == 1 {
+		return stringValue(references[0])
+	}
+	return ""
+}
+
+// repairableTransportBatch 判断终态里的工具批次是不是"清一色原生 run_officejs 调用、外层参数可解析"。
+// 只有这种批次才可能靠一次追问修好：目录外的目标、重复 call_id、外层参数解不出来、条数异常一律不纠错，
+// 交给原来的协议错误/放行路径处理。
+func repairableTransportBatch(response map[string]any, source map[string]any) ([]map[string]any, bool) {
+	if response == nil {
+		return nil, false
+	}
+	if status := stringValue(response["status"]); status != "" && status != "completed" {
+		return nil, false
+	}
+	output, _ := response["output"].([]any)
+	specs := callableClientToolSpecs(source)
+	items := make([]map[string]any, 0, len(output))
+	callIDs := map[string]bool{}
+	for _, value := range output {
+		item := objectValue(value)
+		if !isToolItem(item) {
+			continue
+		}
+		if stringValue(item["type"]) != "function_call" || !isTransportName(stringValue(item["name"])) {
+			return nil, false
+		}
+		callID := stringValue(item["call_id"])
+		if callID == "" || callIDs[callID] {
+			return nil, false
+		}
+		arguments, reason := parseRelayObject(item["arguments"])
+		if reason != "" || arguments == nil {
+			return nil, false
+		}
+		if target := transportTargetName(arguments); target != "" {
+			if _, exists := specs[target]; !exists {
+				return nil, false
+			}
+		}
+		callIDs[callID] = true
+		items = append(items, item)
+	}
+	if len(items) == 0 || len(items) > streamPendingLimit {
+		return nil, false
+	}
+	return items, true
+}
+
+// transportRepairValidation 给出给模型看的失败原因（只有类别级诊断，不回显正文）。
+func transportRepairValidation(items []map[string]any, source map[string]any) error {
+	specs := callableClientToolSpecs(source)
+	for _, item := range items {
+		if _, err := extractNativeClientToolCall(item, specs); err != nil {
+			return relayError("tool_call_not_relayable (Diagnostic: " + relayDiagnostic(item, specs) + ")")
+		}
+	}
+	return nil
+}
+
+// needsTransportRepair 判断这一轮是不是"整批可识别、但至少有一条解不出来"。
+func needsTransportRepair(response map[string]any, source map[string]any) bool {
+	items, eligible := repairableTransportBatch(response, source)
+	if !eligible {
+		return false
+	}
+	return transportRepairValidation(items, source) != nil
+}
+
+// transportCallFingerprint 比较"要执行的操作"，忽略每次调用都会变的 id/call_id。
+func transportCallFingerprint(call map[string]any) string {
+	comparable := cloneObject(call)
+	delete(comparable, "call_id")
+	delete(comparable, "id")
+	return string(jsonBytes(comparable))
+}
+
+// preservesTransportOperations 要求纠错后的批次逐条保持原本要执行的操作：
+// 原本合法的条目必须解析成同一个客户端调用；原本写坏的条目必须保住声明的目标，custom 的裸文本还要逐字不变。
+// 偏差说明：函数工具的 code 允许重写——"把源码错写进 code"这种缺陷只能靠重写成参数 JSON 修好，
+// sub2api 在这里要求逐字相等，会把这种正常修复一起挡掉。
+func preservesTransportOperations(before, after []map[string]any, source map[string]any) bool {
+	specs := callableClientToolSpecs(source)
+	for index := range before {
+		if index >= len(after) {
+			return false
+		}
+		if call, err := extractNativeClientToolCall(before[index], specs); err == nil {
+			other, otherErr := extractNativeClientToolCall(after[index], specs)
+			if otherErr != nil || transportCallFingerprint(call) != transportCallFingerprint(other) {
+				return false
+			}
+			continue
+		}
+		beforeArgs, _ := parseRelayObject(before[index]["arguments"])
+		afterArgs, _ := parseRelayObject(after[index]["arguments"])
+		target := transportTargetName(beforeArgs)
+		if target != "" && transportTargetName(afterArgs) != target {
+			return false
+		}
+		if spec, exists := specs[target]; exists && spec.Type == "custom" {
+			if stringValue(afterArgs["code"]) != stringValue(beforeArgs["code"]) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// toolItemsInOrder 按原位顺序取出终态里的工具条目。
+func toolItemsInOrder(response map[string]any) []any {
+	output, _ := response["output"].([]any)
+	items := make([]any, 0, len(output))
+	for _, value := range output {
+		if item := objectValue(value); isToolItem(item) {
+			items = append(items, value)
+		}
+	}
+	return items
+}
+
+// isNumberValue 判断解密后或本地构造的值是不是数字（用量累加用）。
+func isNumberValue(value any) bool {
+	switch value.(type) {
+	case json.Number, float64, int, int64:
+		return true
+	}
+	return false
+}
+
+// mergeRepairUsage 把追问回合的用量累加进主回合（失败的那几次也要计）。
+func mergeRepairUsage(total, value any) map[string]any {
+	usage := objectValue(value)
+	current := objectValue(total)
+	if usage == nil {
+		return current
+	}
+	result := map[string]any{}
+	for key, item := range current {
+		result[key] = item
+	}
+	for key, item := range usage {
+		if nested := objectValue(item); nested != nil {
+			result[key] = mergeRepairUsage(result[key], nested)
+			continue
+		}
+		if !isNumberValue(item) {
+			continue
+		}
+		delta := numberValue(item)
+		if delta < 0 {
+			continue
+		}
+		result[key] = json.Number(fmt.Sprint(numberValue(result[key]) + delta))
+	}
+	return result
+}
+
+// spliceRepairedToolItems 把纠正后的工具条目按原位填回主回合：响应身份、正文与 output 索引都不变，
+// 追问回合的正文与工具事件一律不重放。
+func spliceRepairedToolItems(original, corrected map[string]any) map[string]any {
+	result := cloneObject(original)
+	output, _ := result["output"].([]any)
+	repaired := toolItemsInOrder(corrected)
+	next := 0
+	for index, value := range output {
+		if item := objectValue(value); isToolItem(item) {
+			if next < len(repaired) {
+				output[index] = repaired[next]
+			}
+			next++
+		}
+	}
+	result["output"] = output
+	if usage := mergeRepairUsage(result["usage"], corrected["usage"]); usage != nil {
+		result["usage"] = usage
+	}
+	return result
+}
+
+// intValue 取一个 JSON 数字/字符串里的整数，取不到按 0 算（只用于递增 agent_iteration）。
+func intValue(value any) int {
+	switch typed := value.(type) {
+	case json.Number:
+		if parsed, err := typed.Int64(); err == nil {
+			return int(parsed)
+		}
+	case float64:
+		return int(typed)
+	case int:
+		return typed
+	case string:
+		var parsed int
+		if _, err := fmt.Sscanf(strings.TrimSpace(typed), "%d", &parsed); err == nil {
+			return parsed
+		}
+	}
+	return 0
+}
+
+// buildToolRepairRequest 在已准备好的上游请求上追加"这一批没有被执行"的回灌和纠正提示：
+// 模型、会话、metadata 与既有历史都保持原样，只递增 agent_iteration，绝不执行任何客户端工具。
+func buildToolRepairRequest(prepared map[string]any, failed map[string]any, source map[string]any, validation error) (map[string]any, error) {
+	if validation == nil {
+		return nil, relayError("tool_repair_requires_validation")
+	}
+	items, eligible := repairableTransportBatch(failed, source)
+	if transportRepairValidation(items, source) == nil {
+		return nil, relayError("tool_repair_batch_is_valid")
+	}
+	if !eligible {
+		return nil, relayError("tool_repair_batch_not_eligible")
+	}
+	input, ok := prepared["input"].([]any)
+	if !ok {
+		return nil, relayError("tool_repair_requires_expanded_history")
+	}
+	request := cloneObject(prepared)
+	next := append([]any{}, input...)
+	if output, ok := failed["output"].([]any); ok {
+		next = append(next, output...)
+	}
+	feedback := string(jsonBytes(map[string]any{
+		"executed": false,
+		"error":    map[string]any{"code": toolRepairFeedbackCode, "message": validation.Error()},
+	}))
+	for _, item := range items {
+		callID := stringValue(item["call_id"])
+		next = append(next, map[string]any{
+			"type":    "function_call_output",
+			"id":      functionItemID(shortHash(callID + ":tool-repair")),
+			"call_id": callID,
+			"output":  feedback,
+		})
+	}
+	next = append(next, messageItem("developer", strings.Replace(toolRepairHint, "%d", fmt.Sprint(len(items)), 1)))
+	request["input"] = next
+	if metadata := objectValue(prepared["metadata"]); metadata != nil {
+		copied := cloneObject(metadata)
+		copied["agent_iteration"] = fmt.Sprint(intValue(copied["agent_iteration"]) + 1)
+		request["metadata"] = copied
+	}
+	return request, nil
+}
+
+// setRepair 注入"整批工具调用尚未执行时可以再追问一次"的回调。
+func (b *toolStreamBridge) setRepair(repair toolRepairFunc) {
+	b.mu.Lock()
+	b.repair = repair
+	b.mu.Unlock()
+}
+
+// lastTerminalResponse 返回已经见过的终态响应（失败收尾时用它保留 id/model/usage）。
+func (b *toolStreamBridge) lastTerminalResponse() map[string]any {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return cloneObject(b.terminalResponse)
+}
+
+// transformedTerminal 校验终态：载荷写坏时先试最多两次封装纠错，救不回来再走原来的放行策略。
+func (b *toolStreamBridge) transformedTerminal(response map[string]any) (map[string]any, error) {
+	_, transformed, _, err := transformResponseBodyPassThrough(jsonBytes(response), b.source)
+	if !needsTransportRepair(response, b.source) {
+		return transformed, err
+	}
+	if corrected, ok := b.repairTransportBatch(response); ok {
+		if _, fixed, _, fixErr := transformResponseBodyPassThrough(jsonBytes(corrected), b.source); fixErr == nil {
+			return fixed, nil
+		}
+	}
+	return transformed, err
+}
+
+// repairTransportBatch 最多追问 maxToolRepairs 次，任何一次修好就用纠正后的工具条目。
+func (b *toolStreamBridge) repairTransportBatch(response map[string]any) (map[string]any, bool) {
+	b.mu.Lock()
+	repair := b.repair
+	b.mu.Unlock()
+	if repair == nil {
+		return nil, false
+	}
+	original, eligible := repairableTransportBatch(response, b.source)
+	if !eligible {
+		return nil, false
+	}
+	validation := transportRepairValidation(original, b.source)
+	if validation == nil {
+		return nil, false
+	}
+	failed := response
+	for attempt := 0; attempt < maxToolRepairs; attempt++ {
+		corrected, err := repair(failed, validation)
+		if err != nil {
+			return nil, false
+		}
+		items, ok := repairableTransportBatch(corrected, b.source)
+		if !ok || len(items) != len(original) {
+			return nil, false
+		}
+		if nextValidation := transportRepairValidation(items, b.source); nextValidation != nil {
+			// 模型没改对（或改得更糟）：换下一轮追问。
+			validation, failed = nextValidation, corrected
+			continue
+		}
+		if _, _, _, checkErr := transformResponseBodyPassThrough(jsonBytes(corrected), b.source); checkErr != nil {
+			// 纠正后的批次还有策略冲突（目录外目标等）：不采用，也不再追问。
+			return nil, false
+		}
+		if !preservesTransportOperations(original, items, b.source) {
+			return nil, false
+		}
+		return spliceRepairedToolItems(response, corrected), true
+	}
+	return nil, false
 }

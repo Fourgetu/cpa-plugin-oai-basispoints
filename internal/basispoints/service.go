@@ -347,22 +347,41 @@ func (s *Service) executeStreamIncremental(request ExecutorRequest, body map[str
 			}
 			_ = s.call("host.stream.close", payload, nil)
 		}
-		// 本地协议问题：以流内 response.failed 交付并干净关闭流，
-		// 不让 CPA 看到插件错误（否则账号会被冷却）。
-		emitFailure := func(code, message string) {
-			payload := map[string]any{"stream_id": request.StreamID, "payload": syntheticFailureStream("", code, message)}
-			if emitErr := s.call("host.stream.emit", payload, nil); emitErr != nil {
-				closeWithError(fail(499, "client_disconnected", "client disconnected while receiving stream"))
-				return
-			}
-			closeWithError(nil)
-		}
 		bridge := newToolStreamBridge(func(payload []byte) error {
 			if len(payload) == 0 {
 				return nil
 			}
 			return s.call("host.stream.emit", map[string]any{"stream_id": request.StreamID, "payload": payload}, nil)
 		}, source)
+		// 整批工具调用都还没执行、只是载荷写坏时，最多追问两次让模型只修封装
+		//（借 ranxi2001/sub2api v2.8.15 / PR #96 的边界）。救不回来就回落到原有的放行自愈路径。
+		bridge.setRepair(func(failed map[string]any, validation error) (map[string]any, error) {
+			// 追问前先把这一轮的流关掉：同一凭据上不要同时占着两个上游连接。
+			_ = s.call("host.http.stream_close", map[string]any{"stream_id": upstream.StreamID}, nil)
+			repairBody, buildErr := buildToolRepairRequest(body, failed, source, validation)
+			if buildErr != nil {
+				return nil, buildErr
+			}
+			repairStream, openErr := s.upstreamStream(request, repairBody, credential)
+			if openErr != nil {
+				return nil, openErr
+			}
+			raw, readErr := s.readUpstreamStream(repairStream)
+			if readErr != nil {
+				return nil, readErr
+			}
+			return parseResponse(raw, repairStream.Headers)
+		})
+		// 本地协议问题：以流内 response.failed 交付并干净关闭流，
+		// 不让 CPA 看到插件错误（否则账号会被冷却）。尽量沿用上游终态的身份与用量。
+		emitFailure := func(code, message string) {
+			payload := map[string]any{"stream_id": request.StreamID, "payload": syntheticFailureStream(bridge.lastTerminalResponse(), "", code, message)}
+			if emitErr := s.call("host.stream.emit", payload, nil); emitErr != nil {
+				closeWithError(fail(499, "client_disconnected", "client disconnected while receiving stream"))
+				return
+			}
+			closeWithError(nil)
+		}
 		stopKeepalive := bridge.startKeepalive()
 		streamErr := s.consumeUpstreamStream(upstream, bridge.handleEvent)
 		stopKeepalive()

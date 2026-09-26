@@ -167,7 +167,7 @@ func TestProtocolErrorDeliversInlineFailure(t *testing.T) {
 		t.Fatalf("protocol error still carries HTTP %d", apiError.Status)
 	}
 
-	stream := string(syntheticFailureStream("resp_test", protocolErr.Kind, protocolErr.Message))
+	stream := string(syntheticFailureStream(nil, "resp_test", protocolErr.Kind, protocolErr.Message))
 	if !strings.Contains(stream, "event: response.failed") || !strings.Contains(stream, `"status":"failed"`) {
 		t.Fatalf("failure stream = %s", stream)
 	}

@@ -20,9 +20,28 @@ plugins:
     - https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/v0.1.14-pro.1/registry.json
 ```
 
-保留已有插件源，不要整体覆盖原有 `plugins` 配置；内置官方源由 CPA 自动保留。本源使用宿主原生的 `github-release` 安装方式，最新版本以本仓库已发布的 GitHub Release 为准，不在 registry 中另行维护版本号。CPA 会按运行平台下载 `oai-basispoints_<version>_<goos>_<goarch>.zip`，并使用同一 Release 的 `checksums.txt` 校验。
+保留已有插件源，不要整体覆盖原有 `plugins` 配置；内置官方源由 CPA 自动保留。本源使用宿主原生的 `github-release` 安装方式，最新版本以本仓库已发布的 GitHub Release 为准，不在 registry 中另行维护版本号。CPA 会按运行平台下载 `oai-basispoints_<version>_<goos>_<goarch>.zip`，并使用同一 Release 的 `checksums.txt` 校验。本仓库的 `main` 分支就是本 fork 的默认分支，内容与最新 tag 一致（只多文档更新）；想跟随最新代码也可以用 `https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/main/registry.json`，上面的 tag 地址则用于钉住具体版本。
 
 发行包覆盖 Linux、macOS、Windows 的 AMD64/ARM64。插件商店负责下载、校验和安装；更新已加载的动态库后仍需重启 CPA，使新代码及 OAuth 认证解析生效。
+
+## 与上游的差异
+
+基线是上游 [JaxsonWang/cpa-plugin-oai-basispoints](https://github.com/JaxsonWang/cpa-plugin-oai-basispoints) 的 `v0.1.14`（commit `1b9359a`）。本分支只在其之上做下面这些改动，上游代码、MIT 许可证与版权声明原样保留；逐条取舍、复现方式与生产实测数据见 [FORK-NOTES.md](FORK-NOTES.md)，版本历史见 [CHANGELOG.md](CHANGELOG.md)。
+
+| # | 改动 | 为什么需要 |
+|---|------|-----------|
+| 1 | custom 工具条目改用 `ctc_` 前缀 id，并用 `normalizeItemIDPrefix` 纠偏历史里残留的错前缀 | 上游按条目类型校验 id 前缀；custom 条目沿用原生 `fc_` 会让后续每次请求 400（`Invalid 'input[n].id': 'fc_…'. Expected an ID that begins with 'ctc'`），一条坏历史污染整段对话 |
+| 2 | 中转载荷**本身写坏**时把原生条目原样放行给原生 Responses 客户端，并把类别级诊断回流到下一轮的重发提示 | 上游对这类输入整轮判废；放行后客户端会回 `unsupported call: run_officejs`，下一轮模型自己按诊断改写，不必重发整轮 |
+| 3 | 协议错误内联交付（流内 `response.failed`、非流式 `status=failed`，HTTP 200） | 协议问题是模型/客户端的问题，不是账号故障；以 5xx 交给 CPA 会把凭据冷却，形成"503 墙" |
+| 4 | 原生 Responses 客户端（`Format == "openai-response"`）走增量流式桥 + 15s SSE 保活 | 上游是"先读完上游 SSE 再整体回放"，长回合下游零字节会被 Cloudflare 524；本分支文本事件到达即下发（实测首字节 13.9s → 2.0s、`output_text.delta` 0 → 572~615） |
+| 5 | `code` 参数声明为 string 的函数工具支持"原始代码直传"：`summary` 放 `codex2api.function_code/<工具名>` 标记、`code` 放源码原文、其余参数作为一个 JSON 对象放 `extended_summary` | 这类工具（如 `mcp__cua_repl.js`）的正文是源码，按普通函数形状塞进 `code` 的 JSON 对象里要二次转义；形态约定沿用 hloolx/codex2api（经 ranxi2001/sub2api 的 BPS 协议包对照） |
+
+此外还有两处收紧，属于本分支对放行策略的加固：
+
+- 放行条目同样参与 `call_id` 唯一性校验，否则下一轮历史里两个同名工具结果无从配对。
+- 形态判别只认 `summary` 里的 `codex2api.function_code/<工具名>` 标记：上游自己的 `extended_summary` 是自然语言调用摘要、模型几乎每条调用都会带，拿"它能不能解析成 JSON 对象"当判据会把普通调用误判成这种形态，custom 工具的参数会被悄悄丢掉。
+
+**按上游保留、本分支不改的**：v0.1.14 的中继信封（`references: [完整工具名]` 路由 + `code` 只承载该工具载荷、custom 原文直传）、message 流式的 `content_part.*` 事件序列、以及"非法调用最多重生成一次"的策略。
 
 ## 安装和配置
 

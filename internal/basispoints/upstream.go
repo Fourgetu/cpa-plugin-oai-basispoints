@@ -2,6 +2,7 @@ package basispoints
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -84,6 +85,10 @@ func authHeaders(c credential, stream bool) http.Header {
 }
 
 func (s *Service) upstreamRequest(request ExecutorRequest, body map[string]any, c credential, stream bool) (upstreamResponse, error) {
+	return s.upstreamRequestAttempt(request, body, c, stream, true)
+}
+
+func (s *Service) upstreamRequestAttempt(request ExecutorRequest, body map[string]any, c credential, stream bool, allowEncryptedRetry bool) (upstreamResponse, error) {
 	cfg := s.config()
 	if cfg.ResponsesURL == "" {
 		return upstreamResponse{}, fail(500, "invalid_config", "responses_url is empty")
@@ -100,12 +105,22 @@ func (s *Service) upstreamRequest(request ExecutorRequest, body map[string]any, 
 		return upstreamResponse{}, fail(502, "upstream_transport", "Basis Points transport failed: "+safeError(err))
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		// 还没有交付任何字节：密文验不过就同路重发一次（同凭据、同请求体其余部分）。
+		if allowEncryptedRetry {
+			if retryBody, ok := prepareEncryptedContentRetry(body, response.StatusCode, response.Body); ok {
+				return s.upstreamRequestAttempt(request, retryBody, c, stream, false)
+			}
+		}
 		return response, upstreamRequestError(response.StatusCode, response.Body, body, c)
 	}
 	return response, nil
 }
 
 func (s *Service) upstreamStream(request ExecutorRequest, body map[string]any, c credential) (upstreamStream, error) {
+	return s.upstreamStreamAttempt(request, body, c, true)
+}
+
+func (s *Service) upstreamStreamAttempt(request ExecutorRequest, body map[string]any, c credential, allowEncryptedRetry bool) (upstreamStream, error) {
 	cfg := s.config()
 	payload := map[string]any{
 		"host_callback_id": request.HostCallbackID,
@@ -126,6 +141,12 @@ func (s *Service) upstreamStream(request ExecutorRequest, body map[string]any, c
 		raw, err := s.readUpstreamStream(stream)
 		if err != nil {
 			return stream, fail(stream.StatusCode, "upstream_error", "Basis Points error body could not be read: "+safeError(err))
+		}
+		// 此时还没有向客户端交付任何字节：密文验不过就同路重发一次。
+		if allowEncryptedRetry {
+			if retryBody, ok := prepareEncryptedContentRetry(body, stream.StatusCode, raw); ok {
+				return s.upstreamStreamAttempt(request, retryBody, c, false)
+			}
 		}
 		return stream, upstreamRequestError(stream.StatusCode, raw, body, c)
 	}
@@ -283,4 +304,89 @@ func upstreamRequestError(status int, raw []byte, body map[string]any, c credent
 		}
 	}
 	return fail(status, "upstream_error", fmt.Sprintf("Basis Points HTTP %d: %s (reasoning_effort=%s; service_tier=%s; input_images=%d; original_detail_images=%d)", status, message, stringValue(body["reasoning_effort"]), tier, images, originalDetails))
+}
+
+// isEncryptedContentRejection 只认"明确说密文验不过"的 400：
+// 普通 400、认证、配额与传输错误都不重放请求（边界借 ranxi2001/sub2api v2.8.16）。
+func isEncryptedContentRejection(status int, raw []byte) bool {
+	if status != http.StatusBadRequest {
+		return false
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil || body == nil {
+		return false
+	}
+	errorObject := objectValue(body["error"])
+	if errorObject == nil {
+		return false
+	}
+	if code := strings.TrimSpace(stringValue(errorObject["code"])); code != "" {
+		return code == "invalid_encrypted_content"
+	}
+	// 上游偶尔不给 code：只认完整的那句诊断，不把正文里随口提到 encryption 当成这个错误。
+	message := strings.ToLower(strings.TrimSpace(stringValue(errorObject["message"])))
+	return strings.HasPrefix(message, "the encrypted content ") &&
+		strings.Contains(message, "could not be verified") &&
+		strings.Contains(message, "could not be decrypted or parsed")
+}
+
+// prepareEncryptedContentRetry 从已准备好的请求里只去掉不透明 reasoning，保留消息、工具结果、附件与路由元数据，
+// 并要求还剩真实历史可重放。压缩项与密文消息可能是用户上下文的唯一副本，绝不能为了"让请求过"而丢。
+func prepareEncryptedContentRetry(body map[string]any, status int, raw []byte) (map[string]any, bool) {
+	if !isEncryptedContentRejection(status, raw) {
+		return nil, false
+	}
+	items, ok := body["input"].([]any)
+	if !ok {
+		return nil, false
+	}
+	kept := make([]any, 0, len(items))
+	removed, hasHistory := false, false
+	for _, value := range items {
+		item := objectValue(value)
+		if item == nil {
+			kept = append(kept, value)
+			continue
+		}
+		itemType := strings.ToLower(strings.TrimSpace(stringValue(item["type"])))
+		if itemType == "reasoning" && stringValue(item["encrypted_content"]) != "" {
+			removed = true
+			continue
+		}
+		if _, exists := item["encrypted_content"]; exists {
+			// 除了不透明 reasoning，其它位置的密文都不动：丢弃等于丢用户的上下文。
+			return nil, false
+		}
+		if parts, ok := item["encrypted_function_args"].([]any); ok && len(parts) > 0 {
+			return nil, false
+		}
+		for _, field := range []string{"content", "output"} {
+			parts, _ := item[field].([]any)
+			for _, part := range parts {
+				partObject := objectValue(part)
+				if partObject == nil {
+					continue
+				}
+				if stringValue(partObject["type"]) == "encrypted_content" {
+					return nil, false
+				}
+				if _, exists := partObject["encrypted_content"]; exists {
+					return nil, false
+				}
+			}
+		}
+		// 只有注入的 developer 指令或压缩触发项不算上下文：重放它们生成不出用户的任务。
+		role := strings.ToLower(strings.TrimSpace(stringValue(item["role"])))
+		if role == "user" || role == "assistant" || itemType == "agent_message" ||
+			itemType == "function_call" || itemType == "function_call_output" {
+			hasHistory = true
+		}
+		kept = append(kept, value)
+	}
+	if !removed || !hasHistory {
+		return nil, false
+	}
+	retry := cloneObject(body)
+	retry["input"] = kept
+	return retry, true
 }

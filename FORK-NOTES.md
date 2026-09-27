@@ -1,7 +1,7 @@
-# Fourgetu fork 说明（分支 `prod/v0.1.14`，版本 `0.1.14-pro.2`）
+# Fourgetu fork 说明（分支 `prod/v0.1.14`，版本 `0.1.14-pro.3`）
 
 本仓库是 [JaxsonWang/cpa-plugin-oai-basispoints](https://github.com/JaxsonWang/cpa-plugin-oai-basispoints) 的 fork，发布在 [Fourgetu/cpa-plugin-oai-basispoints](https://github.com/Fourgetu/cpa-plugin-oai-basispoints)。
-分支 `prod/v0.1.14` 以上游 **v0.1.14**（commit `1b9359a`）为基线，版本号 `0.1.14-pro.2`（与 tag 一致），在上游之上只保留五处生产环境验证过的改动，外加一组有界的工具封装纠错（对齐 ranxi2001/sub2api v2.8.15）。
+分支 `prod/v0.1.14` 以上游 **v0.1.14**（commit `1b9359a`）为基线，版本号 `0.1.14-pro.3`（与 tag 一致）。在上游之上保留五处生产验证过的改动、一组有界的工具封装纠错（对齐 sub2api v2.8.15），以及一组能力/校验边界（对齐上游 v0.1.15–v0.1.18 与 sub2api v2.8.16，见第 8 节）。
 
 除本文列出的差异外，其余行为与 v0.1.14 一致；上游代码、MIT 许可证与版权声明原样保留。
 
@@ -88,3 +88,11 @@ docker run --rm -v "$PWD":/src -w /src golang:1.26 sh -c '
 - 上游 v0.1.12 及更早的历史在 `prod/v0.1.12` 分支保留，便于对比与回退。
 - 形态标记占用 `summary` 字段：这类调用的摘要显示的是标记串而不是自然语言（与 codex2api/sub2api 的约定一致，便于双方回放彼此写下的历史）。
 - **纠错成本**：封装纠错最多向 BPS 追问两次（同凭据、同会话），每次追问的用量都会累加进最终响应；只有"整批可识别但载荷写坏"这一小节才触发，正常回合不受影响。
+
+## 8. 借自上游 v0.1.15–v0.1.18 与 sub2api v2.8.16（0.1.14-pro.3 起）
+
+这一组只补"能力声明与入站校验"的边界，不动交付语义（分离子/信封/失败策略一律保持上面几节的定义）：
+
+- **模型目录**：插件别名按同一目录里的规范模型同步 `apply_patch_tool_type`（规范模型没声明就删掉别名旧值）；删掉 `multi_agent_version` / `multi_agent_reasoning_effort`；`experimental_supported_tools` 只保留 `clock`、`send_user_message_async`，列表非法时 502。
+- **入站拒绝**：结构化 `text.format`（`json_object`/`json_schema`）与 `agent_message` 里的 `encrypted_content` 都在调上游前 400，不静默降级、不猜解密；既有 `reasoning` 密文的处理不变。
+- **密文恢复**：BPS 明确返回 `invalid_encrypted_content` 时，只丢不透明 `reasoning`、用同一凭据同路重发一次；不丢其它位置的密文，普通 400/5xx 不重放。

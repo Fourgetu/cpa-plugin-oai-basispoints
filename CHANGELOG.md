@@ -1,5 +1,14 @@
 # 更新日志
 
+## v0.1.14-pro.3 — 2026-09-26（fork，未发布）
+
+第一批跟进上游 v0.1.15–v0.1.18 与 sub2api v2.8.16 的"能力/校验边界"，都属于少踩坑那一类，不改交付语义：
+
+- **模型目录能力同步**（借上游 v0.1.17）：插件别名按同一目录里的规范模型同步 `apply_patch_tool_type`（规范模型没声明就删掉别名上的旧值），Codex 客户端的原生补丁与文件差异入口因此恢复；显式删掉 `multi_agent_version` / `multi_agent_reasoning_effort`（多代理 v2 需要密文消息契约，中继没实现，不能只抄能力声明）；`experimental_supported_tools` 收敛为已验证白名单 `clock`、`send_user_message_async`，列表非法时返回 502 `model_metadata_missing`。
+- **入站前置校验**（借上游 v0.1.16/17）：`text.format` 为 `json_object`/`json_schema` → 400 `unsupported_text_format`（不再静默丢格式、拿普通正文冒充成功）；结构非法 → 400 `invalid_text_format`；`agent_message` 内容里出现 `encrypted_content` → 400 `unsupported_encrypted_agent_message`（不猜解密、不把密文当明文，也不动既有 reasoning 密文）。
+- **密文验不过时的一次性同路恢复**（借 sub2api v2.8.16）：BPS 明确返回 400 `invalid_encrypted_content`（或等价的完整诊断）时，只丢掉不透明 `reasoning` 项，保留消息、工具结果、附件与路由元数据，用同一凭据重发一次；只有"还剩真实历史"才重放，其它位置的密文一律不丢，普通 400 与 5xx 都不重放。
+- 新增用例 `capability_boundaries_test.go`：模型目录能力同步/白名单/非法元数据、`text.format` 与代理密文校验矩阵、重发判定与请求构造、宿主级"只重发一次"与"普通 400 不重发"。
+
 ## v0.1.14-pro.2 — 2026-09-26（fork，未发布）
 
 跟进 [ranxi2001/sub2api](https://github.com/ranxi2001/sub2api) `v2.8.15`（PR #96）里与本插件相关的修复：

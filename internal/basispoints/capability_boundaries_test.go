@@ -42,7 +42,7 @@ func TestModelCatalogSyncsPatchCapabilityAndWhitelistsExperimentalTools(t *testi
 	alias := catalogAlias(t, svc, catalogBody(
 		map[string]any{
 			"slug": DefaultUpstreamModel, "context_window": 272000, "max_context_window": 872000,
-			"apply_patch_tool_type":      "freeform",
+			"apply_patch_tool_type":        "freeform",
 			"experimental_supported_tools": []string{"clock", "send_user_message_async", "code_mode", "review_policy"},
 			"multi_agent_version":          "v2",
 			"multi_agent_reasoning_effort": "high",

@@ -502,7 +502,7 @@ func translateInputItems(rawInput any, allowed map[string]toolSpec) []any {
 			callID := stringValue(item["call_id"])
 			if native := rememberedNativeCall(callID); native != nil {
 				if callID != "" {
-					origins[callID] = stringValue(native["name"])
+					origins[callID] = transportName
 				}
 				result = append(result, native)
 				continue
@@ -516,14 +516,20 @@ func translateInputItems(rawInput any, allowed map[string]toolSpec) []any {
 				result = append(result, item)
 				continue
 			}
-			if _, exists := allowed[name]; exists {
+			if spec, exists := allowed[name]; exists {
 				if callID != "" {
 					origins[callID] = transportName
 				}
-				result = append(result, fallbackTransportCall(item, allowed[name]))
+				result = append(result, fallbackTransportCall(item, spec))
 				continue
 			}
-			result = append(result, item)
+			// 历史轮调用过、但本轮目录没有声明的工具（压缩请求不带 tools、目录变化或原生缓存逐出）
+			// 也要重编码成中转信封：客户端格式条目直接发给上游会被拒绝，历史里出现过不等于本轮声明过。
+			// 零值 spec 让 fallbackTransportCall 走通用信封（references=[历史工具名]，载荷原样放 code）。
+			if callID != "" {
+				origins[callID] = transportName
+			}
+			result = append(result, fallbackTransportCall(item, toolSpec{}))
 			continue
 		}
 		if itemType == "function_call_output" || itemType == "custom_tool_call_output" {
@@ -1017,14 +1023,27 @@ func schemaMatches(value any, schema map[string]any) bool {
 }
 
 func extractNativeClientToolCall(native map[string]any, specs map[string]toolSpec) (map[string]any, error) {
+	return extractNativeClientToolCallWithCatalog(native, specs, nil)
+}
+
+// extractNativeClientToolCallWithCatalog 区分"未声明"（tool_not_in_catalog）与
+// "声明了但本轮 tool_choice 不允许"（tool_not_allowed_by_tool_choice）：两类都是协议错误，
+// 但纠错提示回灌给模型时需要准确的类别，"目录里没有"会误导模型换工具而不是等 tool_choice 放开。
+func extractNativeClientToolCallWithCatalog(native map[string]any, callable, declared map[string]toolSpec) (map[string]any, error) {
+	if declared == nil {
+		declared = callable
+	}
 	inner, err := transportEnvelope(native)
 	if err != nil {
 		return nil, err
 	}
 	key, _ := inner["tool"].(string)
-	spec, exists := specs[key]
+	spec, exists := declared[key]
 	if !exists {
 		return nil, relayError("tool_not_in_catalog")
+	}
+	if _, callableNow := callable[key]; !callableNow {
+		return nil, relayError("tool_not_allowed_by_tool_choice")
 	}
 	callID := stringValue(native["call_id"])
 	if callID == "" {
@@ -1121,6 +1140,7 @@ func transformResponseBodyWith(body []byte, source map[string]any, passThroughMa
 	}
 	output, _ := response["output"].([]any)
 	specs := callableClientToolSpecs(source)
+	declared := clientToolSpecs(source)
 	replaced := make([]any, 0, len(output))
 	natives := make([]map[string]any, 0)
 	callIDs := map[string]bool{}
@@ -1133,9 +1153,9 @@ func transformResponseBodyWith(body []byte, source map[string]any, passThroughMa
 			replaced = append(replaced, value)
 			continue
 		}
-		call, err := extractNativeClientToolCall(item, specs)
+		call, err := extractNativeClientToolCallWithCatalog(item, specs, declared)
 		if err != nil {
-			diagnostic := relayDiagnostic(item, specs)
+			diagnostic := relayDiagnosticWithCatalog(item, specs, declared)
 			// 运输条目本身写坏（code 不是合法 JSON、外层参数写坏等）：不伪造调用。
 			// 增量流式路径已经给客户端下发过内容、无法重发整轮，所以这里把原生条目原样
 			// 交给客户端：客户端会回一个 "unsupported call: run_officejs"，下一轮
@@ -1330,8 +1350,19 @@ func transportDiagnosticSuffix(callID string) string {
 }
 
 // relayDiagnostic 复算一次中转解析，给出类别级诊断：只报告类别与字节偏移，
-// 不回显工具参数、源码正文或认证信息。
+// 不回显工具参数、源码正文或认证信息。specs 同时充当声明目录与本轮可调用目录；
+// 需要区分"声明了但 tool_choice 不允许"时用 relayDiagnosticWithCatalog。
 func relayDiagnostic(native map[string]any, specs map[string]toolSpec) string {
+	return relayDiagnosticWithCatalog(native, specs, nil)
+}
+
+// relayDiagnosticWithCatalog 区分"未声明"（tool_not_in_catalog）与"声明了但本轮
+// tool_choice 不允许"（tool_not_allowed_by_tool_choice）：两类都是协议错误，
+// 但回灌给模型的纠正提示需要准确的类别——"目录里没有"会误导模型换成别的工具。
+func relayDiagnosticWithCatalog(native map[string]any, callable, declared map[string]toolSpec) string {
+	if declared == nil {
+		declared = callable
+	}
 	if stringValue(native["type"]) != "function_call" || !isTransportName(stringValue(native["name"])) {
 		return "outer_not_transport"
 	}
@@ -1347,9 +1378,12 @@ func relayDiagnostic(native map[string]any, specs map[string]toolSpec) string {
 	if !ok || key == "" || isTransportName(key) {
 		return "invalid_client_tool_reference"
 	}
-	spec, exists := specs[key]
+	spec, exists := declared[key]
 	if !exists {
 		return "tool_not_in_catalog:" + key
+	}
+	if _, callableNow := callable[key]; !callableNow {
+		return "tool_not_allowed_by_tool_choice:" + key
 	}
 	if stringValue(native["call_id"]) == "" {
 		return "missing_call_id"
@@ -1607,6 +1641,59 @@ func bindRawTransportPayloads(original []map[string]any, corrected map[string]an
 		entry := cloneObject(objectValue(next[position]))
 		entry["arguments"] = string(jsonBytes(bound))
 		next[position] = entry
+	}
+	result["output"] = next
+	return result
+}
+
+// restoreVerifiedOperations 恢复"原本就合法"的条目在纠错回合里被模型顺手改写的操作。
+// 纠错追问要求模型整批重发，模型经常把已通过校验的调用一起改写（同工具、不同参数），
+// 那会让操作保全检查拒绝整批、浪费掉唯一一次纠错机会。这里以原始条目的字节为准，
+// 只借纠错条目的 id/call_id——客户端回执按新 call_id 配对、回放缓存按新 call_id 记忆，
+// 而实际执行的操作仍然是模型原始发出的那个。纠错换掉了目标工具时不还原，
+// 交给操作保全检查拒绝整批（防止用参数还原掩盖换目标）。
+func restoreVerifiedOperations(original []map[string]any, corrected map[string]any, source map[string]any) map[string]any {
+	specs := callableClientToolSpecs(source)
+	result := cloneObject(corrected)
+	output, _ := result["output"].([]any)
+	if output == nil {
+		return result
+	}
+	positions := make([]int, 0, len(original))
+	for index, value := range output {
+		if item := objectValue(value); isToolItem(item) {
+			positions = append(positions, index)
+		}
+	}
+	next := append([]any(nil), output...)
+	for index := range original {
+		if index >= len(positions) {
+			break
+		}
+		before, beforeErr := extractNativeClientToolCall(original[index], specs)
+		if beforeErr != nil {
+			continue
+		}
+		position := positions[index]
+		after, afterErr := extractNativeClientToolCall(objectValue(next[position]), specs)
+		if afterErr != nil {
+			continue
+		}
+		if before["type"] != after["type"] || before["name"] != after["name"] || stringValue(before["namespace"]) != stringValue(after["namespace"]) {
+			continue
+		}
+		if transportCallFingerprint(before) == transportCallFingerprint(after) {
+			continue
+		}
+		restored := cloneObject(original[index])
+		correctedItem := objectValue(next[position])
+		if id := stringValue(correctedItem["id"]); id != "" {
+			restored["id"] = id
+		}
+		if callID := stringValue(correctedItem["call_id"]); callID != "" {
+			restored["call_id"] = callID
+		}
+		next[position] = restored
 	}
 	result["output"] = next
 	return result
@@ -2027,7 +2114,7 @@ const maxToolRepairs = 2
 const toolRepairFeedbackCode = "invalid_client_tool_transport"
 
 // toolRepairHint 是纠错追问里给模型的指令：只讲封装格式，不解释代码、不推断目标。
-const toolRepairHint = "The preceding tool batch failed transport validation before any client tool was executed. Correct only its transport formatting: return exactly %d run_officejs calls, in the same order, for the same client tools, preserving the intended operations and any raw payload byte for byte. Route with outer references containing exactly one catalog tool name and put only that tool's payload in code (a JSON arguments object for function tools, unchanged raw input for custom tools). For a function tool whose catalog line says its code parameter carries source text, also set summary to that tool's codex2api.function_code marker and put its other arguments as one JSON object in extended_summary. For a function tool whose catalog line says its cmd parameter is a shell command, also set summary to that tool's codex2api.function_cmd marker, keep that command raw in code and put its other arguments as one JSON object in extended_summary. Fix only the transport and the argument fields the schema rejected: never replace the command or payload the model already produced. Do not execute Office code, do not add operations, do not repeat commentary."
+const toolRepairHint = "The preceding tool batch failed transport validation before any client tool was executed. Correct only its transport formatting: return exactly %d run_officejs calls, in the same order, for the same client tools, preserving the intended operations and any raw payload byte for byte. Route with outer references containing exactly one catalog tool name and put only that tool's payload in code (a JSON arguments object for function tools, unchanged raw input for custom tools). For a function tool whose catalog line says its code parameter carries source text, also set summary to that tool's codex2api.function_code marker and put its other arguments as one JSON object in extended_summary. For a function tool whose catalog line says its cmd parameter is a shell command, also set summary to that tool's codex2api.function_cmd marker, keep that command raw in code and put its other arguments as one JSON object in extended_summary. Fix only the transport and the argument fields the schema rejected: never replace the command or payload the model already produced. Calls that already passed validation must remain unchanged. Do not execute Office code, do not add operations, do not repeat commentary."
 
 // toolRepairFunc 用同一凭据、同一会话再向 BPS 要一次修正结果；此时整个工具批次仍未执行。
 type toolRepairFunc func(response map[string]any, validation error) (map[string]any, error)
@@ -2093,9 +2180,10 @@ func repairableTransportBatch(response map[string]any, source map[string]any) ([
 // transportRepairValidation 给出给模型看的失败原因（只有类别级诊断，不回显正文）。
 func transportRepairValidation(items []map[string]any, source map[string]any) error {
 	specs := callableClientToolSpecs(source)
+	declared := clientToolSpecs(source)
 	for _, item := range items {
-		if _, err := extractNativeClientToolCall(item, specs); err != nil {
-			return relayError("tool_call_not_relayable (Diagnostic: " + relayDiagnostic(item, specs) + ")")
+		if _, err := extractNativeClientToolCallWithCatalog(item, specs, declared); err != nil {
+			return relayError("tool_call_not_relayable (Diagnostic: " + relayDiagnosticWithCatalog(item, specs, declared) + ")")
 		}
 	}
 	return nil
@@ -2351,8 +2439,10 @@ func (b *toolStreamBridge) repairTransportBatch(response map[string]any) (map[st
 			validation, failed = nextValidation, corrected
 			continue
 		}
-		// 纠正可以重排封装，但不能换掉已发出的操作正文：先把原始的裸载荷字节绑回纠正后的条目，
-		// 再按绑回结果复算一次（绑回不会把原本合法的批次改坏）。
+		// 纠正可以重排封装，但不能换掉已发出的操作正文：先恢复"原本合法"条目被模型顺手改写的
+		// 操作（以原始字节为准，只借纠错条目的 id/call_id），再把"原本写坏"条目的原始裸载荷
+		// 字节绑回纠正后的条目，最后按还原结果复算一次（还原不会把合法批次改坏）。
+		corrected = restoreVerifiedOperations(original, corrected, b.source)
 		corrected = bindRawTransportPayloads(original, corrected, b.source)
 		items, ok = repairableTransportBatch(corrected, b.source)
 		if !ok || len(items) != len(original) {

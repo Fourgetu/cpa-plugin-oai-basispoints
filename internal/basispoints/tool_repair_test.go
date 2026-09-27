@@ -284,3 +284,102 @@ func TestFailureStreamKeepsTerminalIdentity(t *testing.T) {
 		t.Fatalf("failure stream is not a failed response: %s", stream)
 	}
 }
+
+// 混合批次（一条已验证合法 + 一条写坏）纠错时，模型经常顺手改写已合法条目的参数。
+// restoreVerifiedOperations 要以原始条目的字节为准、只借纠错条目的 id/call_id，
+// 让"一次纠错修好整批"成为可能；换目标工具的纠错不还原，交给操作保全拒绝。
+func TestRepairRestoresVerifiedOperations(t *testing.T) {
+	source := map[string]any{"tools": []any{
+		map[string]any{"type": "function", "name": "shell", "parameters": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"cmd":     map[string]any{"type": "string"},
+				"workdir": map[string]any{"type": "string"},
+			},
+		}},
+		map[string]any{"type": "custom", "name": "apply_patch"},
+	}}
+	specs := callableClientToolSpecs(source)
+	valid := namespaceTestNative("valid", "shell", map[string]any{"cmd": "pwd", "workdir": "/original"})
+	broken := brokenRelayFixture("apply_patch", "*** Begin Patch\n+hi\n")
+	original := []map[string]any{valid, broken}
+	if _, err := extractNativeClientToolCall(valid, specs); err != nil {
+		t.Fatalf("fixture must be valid: %v", err)
+	}
+	// 纠错回合：模型修好了 apply_patch 的载荷，但把已合法的 shell 参数也改了，并换了 call_id。
+	rewritten := map[string]any{
+		"type": "function_call", "id": "fc_changed", "call_id": "call_changed", "name": transportName,
+		"arguments": string(jsonBytes(map[string]any{
+			"references": []any{"shell"},
+			"code":       string(jsonBytes(map[string]any{"cmd": "rm -rf changed", "workdir": "/changed"})),
+		})),
+	}
+	fixed := map[string]any{
+		"type": "function_call", "id": "fc_fixed", "call_id": "call_fixed", "name": transportName,
+		"arguments": string(jsonBytes(map[string]any{
+			"references": []any{"apply_patch"},
+			"code":       string(jsonBytes(map[string]any{})),
+		})),
+	}
+	corrected := repairResponse(rewritten, fixed)
+	restored := restoreVerifiedOperations(original, corrected, source)
+	items, ok := repairableTransportBatch(restored, source)
+	if !ok || len(items) != 2 {
+		t.Fatalf("restored batch is not repairable: ok=%v", ok)
+	}
+	if !preservesTransportOperations(original, items, source) {
+		t.Fatal("restored batch still fails operation preservation")
+	}
+	before, _ := extractNativeClientToolCall(valid, specs)
+	after, _ := extractNativeClientToolCall(objectValue(restored["output"].([]any)[0]), specs)
+	if transportCallFingerprint(before) != transportCallFingerprint(after) {
+		t.Fatalf("verified operation was not restored: %#v", after)
+	}
+	if after["call_id"] != "call_changed" || after["id"] != "fc_changed" {
+		t.Fatalf("restored entry must keep the corrected identity: %#v", after)
+	}
+	// 模型响应本体不被改写。
+	if !strings.Contains(stringValue(objectValue(corrected["output"].([]any)[0])["arguments"]), "rm -rf changed") {
+		t.Fatal("restore rewrote the model response in place")
+	}
+}
+
+// 纠错把已合法条目换成另一个目标工具时不还原：操作保全必须拒绝整批。
+func TestRepairRejectsSwappedToolInVerifiedOperation(t *testing.T) {
+	source := map[string]any{"tools": []any{
+		map[string]any{"type": "function", "name": "shell", "parameters": map[string]any{
+			"type": "object", "properties": map[string]any{"cmd": map[string]any{"type": "string"}},
+		}},
+		map[string]any{"type": "custom", "name": "apply_patch"},
+	}}
+	specs := callableClientToolSpecs(source)
+	valid := namespaceTestNative("valid", "shell", map[string]any{"cmd": "pwd"})
+	broken := brokenRelayFixture("apply_patch", "raw patch")
+	original := []map[string]any{valid, broken}
+	swapped := map[string]any{
+		"type": "function_call", "id": "fc_swapped", "call_id": "call_swapped", "name": transportName,
+		"arguments": string(jsonBytes(map[string]any{
+			"references": []any{"apply_patch"},
+			"code":       "patch text",
+		})),
+	}
+	fixed := map[string]any{
+		"type": "function_call", "id": "fc_fixed", "call_id": "call_fixed", "name": transportName,
+		"arguments": string(jsonBytes(map[string]any{
+			"references": []any{"apply_patch"},
+			"code":       string(jsonBytes(map[string]any{})),
+		})),
+	}
+	restored := restoreVerifiedOperations(original, repairResponse(swapped, fixed), source)
+	items, ok := repairableTransportBatch(restored, source)
+	if !ok {
+		t.Fatal("restored batch must stay repairable in shape")
+	}
+	if preservesTransportOperations(original, items, source) {
+		t.Fatal("a correction that swapped the target tool was accepted")
+	}
+	after, err := extractNativeClientToolCall(objectValue(restored["output"].([]any)[0]), specs)
+	if err != nil || after["name"] != "apply_patch" {
+		t.Fatalf("swapped entry must stay as the model produced it: %#v err=%v", after, err)
+	}
+}

@@ -1,6 +1,6 @@
 # CPA OpenAI Basis Points 插件
 
-> 本仓库是 [Fourgetu](https://github.com/Fourgetu) 的 fork：基线为上游 v0.1.14，版本号 `0.1.14-pro.4`。相对上游的改动、分流条件与取舍见 [FORK-NOTES.md](FORK-NOTES.md)，更新日志见 [CHANGELOG.md](CHANGELOG.md)。上游代码、MIT 许可证与版权声明原样保留。
+> 本仓库是 [Fourgetu](https://github.com/Fourgetu) 的 fork：代码基线为上游 v0.1.14，版本号 `0.2.2-pro.1`（从本版起跟随上游版本线：0.2.2-pro.1 = 对齐上游 v0.2.2 时点的修复集，不含上游 v0.1.18 streaming 重写与 v0.2.0 WS 传输）。相对上游的改动、分流条件与取舍见 [FORK-NOTES.md](FORK-NOTES.md)，更新日志见 [CHANGELOG.md](CHANGELOG.md)。上游代码、MIT 许可证与版权声明原样保留。
 这是一个 CLIProxyAPI（CPA）原生插件，用 CPA 已有的 ChatGPT/Codex OAuth 凭据直接请求。
 
 ## 通过 CPA 插件商店安装（推荐）
@@ -8,7 +8,7 @@
 在管理界面的「第三方插件源 → 插件源 registry URL (plugins.store-sources)」中添加以下地址并保存，然后刷新插件商店，搜索 **CPA OpenAI Basis Points**：
 
 ```text
-https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/v0.1.14-pro.4/registry.json
+https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/v0.2.2-pro.1/registry.json
 ```
 
 也可合并到 CPA **宿主配置**（`config.yaml`，与下方插件配置共用同一个 `plugins` 节点）：
@@ -17,7 +17,7 @@ https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/v0.1.14-pr
 plugins:
   enabled: true
   store-sources:
-    - https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/v0.1.14-pro.4/registry.json
+    - https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/v0.2.2-pro.1/registry.json
 ```
 
 保留已有插件源，不要整体覆盖原有 `plugins` 配置；内置官方源由 CPA 自动保留。本源使用宿主原生的 `github-release` 安装方式，最新版本以本仓库已发布的 GitHub Release 为准，不在 registry 中另行维护版本号。CPA 会按运行平台下载 `oai-basispoints_<version>_<goos>_<goarch>.zip`，并使用同一 Release 的 `checksums.txt` 校验。本仓库的 `main` 分支就是本 fork 的默认分支，内容与最新 tag 一致（只多文档更新）；想跟随最新代码也可以用 `https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/main/registry.json`，上面的 tag 地址则用于钉住具体版本。
@@ -26,7 +26,7 @@ plugins:
 
 ## 与上游的差异
 
-基线是上游 [JaxsonWang/cpa-plugin-oai-basispoints](https://github.com/JaxsonWang/cpa-plugin-oai-basispoints) 的 `v0.1.14`（commit `1b9359a`）。本分支只在其之上做下面这些改动，上游代码、MIT 许可证与版权声明原样保留；逐条取舍、复现方式与生产实测数据见 [FORK-NOTES.md](FORK-NOTES.md)，版本历史见 [CHANGELOG.md](CHANGELOG.md)。
+代码基线是上游 [JaxsonWang/cpa-plugin-oai-basispoints](https://github.com/JaxsonWang/cpa-plugin-oai-basispoints) 的 `v0.1.14`（commit `1b9359a`）。**版本号从 0.2.2-pro.1 起跟随上游版本线**：版本号线 = 上游 v0.2.2 时点，表示兼容性对齐（吸收到该时点适用的修复），不表示代码吸收到 v0.2.2——上游 v0.1.18 的 streaming 重写与 v0.2.0 的 WS 传输均未采纳。本分支只在 v0.1.14 之上做下面这些改动，上游代码、MIT 许可证与版权声明原样保留；逐条取舍、复现方式与生产实测数据见 [FORK-NOTES.md](FORK-NOTES.md)，版本历史见 [CHANGELOG.md](CHANGELOG.md)。
 
 | # | 改动 | 为什么需要 |
 |---|------|-----------|
@@ -37,6 +37,11 @@ plugins:
 | 5 | `code` 参数声明为 string 的函数工具支持"原始代码直传"：`summary` 放 `codex2api.function_code/<工具名>` 标记、`code` 放源码原文、其余参数作为一个 JSON 对象放 `extended_summary` | 这类工具（如 `mcp__cua_repl.js`）的正文是源码，按普通函数形状塞进 `code` 的 JSON 对象里要二次转义；形态约定沿用 hloolx/codex2api（经 ranxi2001/sub2api 的 BPS 协议包对照） |
 | 6 | `exec_command` 一族（`cmd` 参数声明为 string）支持"命令原文直传"：`summary` 放 `codex2api.function_cmd/<工具名>` 标记、命令原文进 `code`、其余参数作为一个 JSON 对象放 `extended_summary` | 命令正文按普通函数形状塞进 `code` 的 JSON 对象里同样要二次转义；中转只校验传输不变量（不解析/不修复/不评估命令），形态约定沿用 hloolx/codex2api，经 ranxi2001/sub2api 的 BPS 协议实践对照 |
 | 7 | 工具结果的内联图片（`function_call_output` / `custom_tool_call_output` 的 `output` 数组里的 `data:`）现在也上传并回填 `file_id`；上传前做整请求预检（≤20 张、单图解码后 ≤20 MiB、累计 ≤32 MiB、解码后 ≤64 MP），并收紧 `file_id`（`file-` 前缀 + 6..256 + `[A-Za-z0-9_-]`）与 `detail`（`auto\|low\|high\|original`）校验 | 此前工具结果里的图片被整条跳过、模型看不到图；预检避免上传中途失败留下孤儿附件 |
+| 8 | 无目录轮的历史调用重编码成中转信封（`references=[历史工具名]`、载荷原样放 `code`） | 压缩请求不带 `tools`、目录变化或原生缓存逐出时，客户端格式历史调用原样透传会被上游直接拒绝；错前缀 id 也随重编码在源头消失 |
+| 9 | 混合批次纠错用 `restoreVerifiedOperations` 恢复已验证操作：以原始条目字节为准、只借纠错条目的 id/call_id | 纠错要求模型整批重发，常顺手改写已通过校验的条目参数，导致整批被操作保全拒绝、浪费纠错机会；换目标工具的纠错仍整批拒绝 |
+| 10 | `tool_choice` 诊断细分：声明了但不允许报 `tool_not_allowed_by_tool_choice`，真未声明仍是 `tool_not_in_catalog` | 此前混报 `tool_not_in_catalog` 会误导回灌给模型的纠正提示；两类都仍是 422 协议错误，不触发 5xx/冷却 |
+| 11 | `agent_message` 的 `content` 内联图片与用户消息同样上传，并参与整请求预检 | 多代理协作历史里的图片此前被"assistant 消息跳过"规则漏掉，模型看不到图 |
+| 12 | 回归测试钉：未知历史条目类型（`mcp_call`、`local_shell_call`、`web_search_call`、`computer_call`、`compaction_trigger` 等）原样透传；畸形中转载荷整批拒绝 | 防止后续改动静默删除/改写历史条目（移植上游 v0.2.x 的测试意图） |
 
 此外还有两处收紧，属于本分支对放行策略的加固：
 

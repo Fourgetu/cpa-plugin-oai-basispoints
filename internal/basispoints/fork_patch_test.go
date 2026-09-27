@@ -44,33 +44,45 @@ func TestCustomToolCallUsesCustomItemID(t *testing.T) {
 	}
 }
 
-// 历史里残留错前缀时要纠偏，否则一条坏历史会让整段对话每次都 400、重试也救不回来。
+// 无目录的历史调用一律重编码成中转信封（0.2.2-pro.1 起的行为，对齐上游 PR #14）：
+// 客户端格式条目不再原样透传给上游，错前缀 id 也就不会再出现在上游请求里。
 func TestTranslateInputItemsRepairsItemIDPrefix(t *testing.T) {
-	source := map[string]any{} // 目录为空 → 走原样透传分支，正好检验纠偏本身
+	source := map[string]any{} // 目录为空：任何客户端格式历史都必须重编码
 
 	poisoned := map[string]any{
 		"type": "custom_tool_call", "id": "fc_03ea15adb7ed6a15", "call_id": "call_poisoned",
 		"name": "gone_from_catalog", "input": "*** Begin Patch",
 	}
 	got := objectValue(translateInputItems([]any{poisoned}, clientToolSpecs(source))[0])
-	if id := stringValue(got["id"]); id != "ctc_03ea15adb7ed6a15" {
-		t.Fatalf("id = %q, want the same body with a ctc_ prefix", id)
+	if got["name"] != transportName {
+		t.Fatalf("uncatalogued custom history was passed through verbatim: %#v", got)
+	}
+	if id := stringValue(got["id"]); !strings.HasPrefix(id, itemIDPrefixFunction) {
+		t.Fatalf("id = %q, want a fresh transport id", id)
+	}
+	if outer := parseArguments(got["arguments"]); outer["code"] != "*** Begin Patch" {
+		t.Fatalf("raw payload = %#v", outer["code"])
 	}
 
 	keep := map[string]any{
 		"type": "function_call", "id": "fc_keepme", "call_id": "call_keep",
 		"name": "gone_from_catalog", "arguments": "{}",
 	}
-	if again := objectValue(translateInputItems([]any{keep}, clientToolSpecs(source))[0]); stringValue(again["id"]) != "fc_keepme" {
-		t.Fatalf("untouched id was rewritten: %#v", again)
+	again := objectValue(translateInputItems([]any{keep}, clientToolSpecs(source))[0])
+	if again["name"] != transportName || !strings.HasPrefix(stringValue(again["id"]), itemIDPrefixFunction) {
+		t.Fatalf("uncatalogued function history was passed through verbatim: %#v", again)
+	}
+	if outer := parseArguments(again["arguments"]); outer["code"] != "{}" {
+		t.Fatalf("function payload = %#v", outer["code"])
 	}
 
 	odd := map[string]any{
 		"type": "custom_tool_call", "id": "weird_123", "call_id": "call_odd",
 		"name": "gone_from_catalog", "input": "x",
 	}
-	if unknown := objectValue(translateInputItems([]any{odd}, clientToolSpecs(source))[0]); stringValue(unknown["id"]) != "weird_123" {
-		t.Fatalf("unknown prefix was rewritten: %#v", unknown)
+	unknown := objectValue(translateInputItems([]any{odd}, clientToolSpecs(source))[0])
+	if unknown["name"] != transportName || !strings.HasPrefix(stringValue(unknown["id"]), itemIDPrefixFunction) {
+		t.Fatalf("odd-prefix history was passed through verbatim: %#v", unknown)
 	}
 }
 

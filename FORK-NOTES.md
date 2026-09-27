@@ -1,7 +1,7 @@
-# Fourgetu fork 说明（分支 `prod/v0.1.14`，版本 `0.1.14-pro.4`）
+# Fourgetu fork 说明（分支 `prod/v0.1.14`，版本 `0.2.2-pro.1`）
 
 本仓库是 [JaxsonWang/cpa-plugin-oai-basispoints](https://github.com/JaxsonWang/cpa-plugin-oai-basispoints) 的 fork，发布在 [Fourgetu/cpa-plugin-oai-basispoints](https://github.com/Fourgetu/cpa-plugin-oai-basispoints)。
-分支 `prod/v0.1.14` 以上游 **v0.1.14**（commit `1b9359a`）为基线，版本号 `0.1.14-pro.4`（与 tag 一致）。在上游之上保留五处生产验证过的改动、一组有界的工具封装纠错（对齐 sub2api v2.8.15）、一组能力/校验边界（对齐上游 v0.1.15–v0.1.18 与 sub2api v2.8.16，见第 8 节），以及命令原文直传与附件预检一组（对齐 sub2api 的 BPS 协议实践，见第 9、10 节）。
+分支 `prod/v0.1.14` 以上游 **v0.1.14**（commit `1b9359a`）为**代码基线**。**从 0.2.2-pro.1 起 `Version` 跟随上游版本线**：上游最新 v0.2.2 → 本版 `0.2.2-pro.1`，tag 仍 = `v` + `Version`（即 `v0.2.2-pro.1`）；版本号只表示兼容性对齐点（吸收到上游 v0.2.2 时点适用的修复），代码仍是 v0.1.14 基线 + 自研增量流式桥——**未采纳**上游 v0.1.18 的 streaming 重写与 v0.2.0 的 WS 传输（上游自家生产部署里 WS 握手持续 404、其验证文档也不主张性能收益，故观望）。在上游之上保留五处生产验证过的改动、一组有界的工具封装纠错（对齐 sub2api v2.8.15）、一组能力/校验边界（对齐上游 v0.1.15–v0.1.18 与 sub2api v2.8.16，见第 8 节）、命令原文直传与附件预检一组（对齐 sub2api 的 BPS 协议实践，见第 9、10 节），以及第一批上游 v0.2.x / sub2api v2.8.19 修复（见第 11 节）。
 
 除本文列出的差异外，其余行为与 v0.1.14 一致；上游代码、MIT 许可证与版权声明原样保留。
 
@@ -118,3 +118,19 @@ docker run --rm -v "$PWD":/src -w /src golang:1.26 sh -c '
 - 体积/像素校验对标准库没有解码器的格式（例如 webp）只保留体积上限，跳过格式与像素校验；声明了有解码器的类型却读不出头仍然拒绝。
 - 本插件**不做** relay 模式、服务端图片设置项（如 `excel_bps_image_mode`）、附件缓存 TTL 与并发在途上限、`file-preflight` 占位——那些是多用户网关的取向。
 - 仍然不做：回放缓存的字节上限/TTL、codex/Claude 格式的增量流式。
+
+## 11. 第一批上游 v0.2.x / sub2api v2.8.19 修复（0.2.2-pro.1 起）
+
+本批吸收上游 v0.2.x 与 [ranxi2001/sub2api](https://github.com/ranxi2001/sub2api) v2.8.19 里适用的修复（第一批），版本号也从此跟进上游版本线（见文首"当前版本"）。五项改动都不改交付语义：
+
+- **无目录时的历史回放**（对齐上游 PR #14 后半）：历史轮调用过、但本轮目录没有声明的工具（压缩请求不带 `tools`、目录变化或原生缓存逐出）时，客户端格式的历史调用也重编码成中转信封：`references=[历史工具名]`、载荷原样放 `code`。此前原样透传会被上游直接拒绝；副作用是客户端格式条目不再透传，历史里残留的错前缀 id（`fc_`/`ctc_` 混用）也随重编码在源头消失（此前靠 `normalizeItemIDPrefix` 逐条纠偏，现在连源头都没有了）。实现用"零值 spec 走通用信封"：`fallbackTransportCall` 对零值 `toolSpec` 不走 `function_code`/`function_cmd` 分支，因此这两种形态的历史在无目录轮退化为通用形态（`references` 路由 + 载荷原样），与上游行为一致。
+- **混合批次纠错恢复已验证操作**（对齐 sub2api v2.8.19 PR #124）：纠错追问要求模型整批重发，模型经常顺手改写已通过校验的条目参数，导致操作保全检查拒绝整批、浪费纠错机会。新增 `restoreVerifiedOperations`：以原始条目字节为准、只借纠错条目的 `id`/`call_id`（客户端回执与回放缓存按新 `call_id` 配对）。它与 pro.4 的 `bindRawTransportPayloads` 互补——前者只动"原本合法"的条目、后者只动"原本写坏"的条目；顺序是先 restore 再 bindRaw，随后复跑 `repairableTransportBatch` + `transformResponseBodyPassThrough` 整批复验。纠错换掉目标工具时不还原（防"用参数还原掩盖换目标"），仍由 `preservesTransportOperations` 拒绝整批——已有测试 `TestRepairRejectsSwappedToolInVerifiedOperation` 钉住。纠错提示词同步补了 "Calls that already passed validation must remain unchanged."。
+- **`tool_choice` 诊断细分**（对齐上游 PR #13）：工具"声明了但本轮 `tool_choice` 不允许"现在报 `tool_not_allowed_by_tool_choice`，真未声明仍是 `tool_not_in_catalog`；此前把前者误报成后者，会误导回灌给模型的纠正提示（提示会往"把工具加进目录/换用目录内工具"方向带，而实际该修的是 `tool_choice`）。该细分只影响回灌给模型的错误类别，两类仍是 422 协议错误、不触发 5xx/冷却；诊断仍只有类别与字节偏移，不回显载荷正文。
+- **`agent_message` 图片参与上传**（对齐 sub2api v2.8.19）：多代理协作历史里 `agent_message` 条目的 `content` 内联图片与用户消息同样上传成附件引用；`agent_message` 不受"assistant 消息跳过"规则影响（那是为了不碰 assistant 正文里的 reasoning/加密块），其图片同样参与整请求预检（20 张 / 20 MiB / 32 MiB / 64 MP）。
+- **回归测试钉**（移植上游 v0.2.x 的测试意图）：未知历史条目类型（`mcp_call`、`local_shell_call`、`web_search_call`、`computer_call`、`compaction_trigger` 等）原样透传，不静默删除/改写（只剥内部标记）；畸形中转载荷整批拒绝。
+
+已知不做（本版明确列出）：
+
+- **WS 传输与源认证菜单**：观望。上游自家生产部署里 WS 握手持续 404，其验证文档也不主张性能收益；现有 SSE 增量桥 + 15s 保活够用。
+- **上游 `request_lifecycle` 主动取消**：我们用 15s keepalive 检测断开（断流按传输故障收尾），够用。
+- **P0-C 历史 author/recipient 归一化与 P0-D 工具截图落位调整**：评估过，留待第二批实测上游行为后再动。

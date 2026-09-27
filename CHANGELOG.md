@@ -1,5 +1,15 @@
 # 更新日志
 
+## v0.2.2-pro.1 — 2026-09-27（fork，未发布）
+
+**版本号从本版起跟随上游版本线**：`0.2.2-pro.1` 表示对齐上游 v0.2.2 时点的修复集（上游最新 v0.2.2）；代码基线仍是上游 **v0.1.14** + 我们自己的实现（含自研增量流式桥），**不包含**上游 v0.1.18 的 streaming 重写与 v0.2.0 的 WS 传输。本版为第一批吸收自上游 v0.2.x 与 sub2api v2.8.19 的适用修复：
+
+- **无目录时的历史回放修复**（对齐上游 PR #14 后半）：历史轮调用过、但本轮目录没有声明的工具（压缩请求不带 `tools`、目录变化或原生缓存逐出）时，客户端格式的历史调用也重编码成中转信封（`references=[历史工具名]`、载荷原样放 `code`）；此前原样透传会被上游直接拒绝。副作用：客户端格式条目不再透传，历史里残留的错前缀 id（`fc_`/`ctc_` 混用）也随重编码在源头消失。
+- **混合批次纠错恢复已验证操作**（对齐 sub2api v2.8.19 PR #124）：纠错追问要求模型整批重发，模型经常顺手改写已通过校验的条目参数，导致操作保全检查拒绝整批、浪费纠错机会。新增 `restoreVerifiedOperations`：以原始条目字节为准、只借纠错条目的 id/call_id（客户端回执与回放缓存按新 call_id 配对）；纠错换掉目标工具时不还原，仍由操作保全拒绝整批。纠错提示词同步补了 "Calls that already passed validation must remain unchanged."
+- **`tool_choice` 诊断细分**（对齐上游 PR #13）：工具"声明了但本轮 tool_choice 不允许"现在报 `tool_not_allowed_by_tool_choice`（此前误报 `tool_not_in_catalog`，会误导回灌给模型的纠正提示）；真未声明仍是 `tool_not_in_catalog`。诊断仍只有类别与字节偏移，不回显载荷正文。
+- **`agent_message` 图片参与上传**（对齐 sub2api v2.8.19）：多代理协作历史里 `agent_message` 条目的 `content` 内联图片与用户消息同样上传成附件引用；`agent_message` 不受"assistant 消息跳过"规则影响，其图片同样参与整请求预检（20 张 / 20 MiB / 32 MiB / 64 MP）。
+- **回归测试钉**（移植上游 v0.2.x 的测试意图）：未知历史条目类型（`mcp_call`、`local_shell_call`、`web_search_call`、`computer_call`、`compaction_trigger` 等）原样透传，不静默删除/改写；畸形中转载荷整批拒绝。
+
 ## v0.1.14-pro.4 — 2026-09-26（fork，未发布）
 
 第三批跟进 [ranxi2001/sub2api](https://github.com/ranxi2001/sub2api) 的 BPS 协议实践，围绕"命令原文直传、纠错只重排封装、附件预检"三类边界，仍不改交付语义：

@@ -137,6 +137,9 @@ func inlineImageField(item map[string]any) string {
 	switch stringValue(item["type"]) {
 	case "", "message":
 		return "content"
+	case "agent_message":
+		// 多代理协作历史里的 agent_message 也可能带内联图片：与用户消息同样上传成附件引用。
+		return "content"
 	case "function_call_output", "custom_tool_call_output":
 		return "output"
 	default:
@@ -213,8 +216,8 @@ func (s *Service) uploadInputImages(request ExecutorRequest, body map[string]any
 			continue
 		}
 		// assistant 历史消息里的图片保持原样：上游不接受 assistant 消息内的 input_image，
-		// 只处理用户/系统消息与工具结果。
-		if field == "content" && stringValue(item["role"]) == "assistant" {
+		// 只处理用户/系统消息、agent_message 与工具结果。
+		if field == "content" && stringValue(item["role"]) == "assistant" && stringValue(item["type"]) != "agent_message" {
 			continue
 		}
 		parts, _ := item[field].([]any)

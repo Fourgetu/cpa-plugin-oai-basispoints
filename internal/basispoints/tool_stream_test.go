@@ -189,7 +189,8 @@ func TestExecutorNativeToolRoundTrip(t *testing.T) {
 					if call["namespace"] != "mcp__node_repl" || call["name"] != "js" {
 						t.Fatalf("executor lost tool routing: %#v", call)
 					}
-					image := []any{map[string]any{"type": "input_image", "image_url": "data:image/png;base64,dGVzdA=="}}
+					// 内联 data: 图片现在会走附件上传；这里只验证工具结果身份与远程引用的透传。
+					image := []any{map[string]any{"type": "input_image", "image_url": "https://example.test/tool-result.png"}}
 					resultType := "function_call_output"
 					if toolType == "custom" {
 						resultType = "custom_tool_call_output"

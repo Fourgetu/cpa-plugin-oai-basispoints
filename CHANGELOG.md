@@ -1,5 +1,17 @@
 # 更新日志
 
+## v0.1.14-pro.4 — 2026-09-26（fork，未发布）
+
+第三批跟进 [ranxi2001/sub2api](https://github.com/ranxi2001/sub2api) 的 BPS 协议实践，围绕"命令原文直传、纠错只重排封装、附件预检"三类边界，仍不改交付语义：
+
+- **`exec_command` 命令原文直传**：`cmd` 参数声明为字符串的 `exec_command` 一族可走"命令原文直传"——外层 `summary` 写 `codex2api.function_cmd/<完整工具名>`、命令原文进 `code`、其余参数作为一个 JSON 对象放 `extended_summary`。中转只校验传输不变量：不解析、不修复、不评估这段命令，也不把它当成另一个工具调用；客户端仍是参数 schema 的权威，多余或向前兼容字段不因此判废整条流。目录说明与纠错提示同步教会模型这个形态；历史回放会把已执行调用重新编码成同一形态。
+- **纠错只能重排封装，不能换掉操作正文**：纠错后条目里由模型原始发出的裸载荷字节会被绑回（覆盖 `custom` / `function_code` / `function_cmd` 三种裸形态），换了命令或载荷正文的纠正一律不采用；原本合法、或原始 `code` 本身就是 JSON 信封的条目不受影响。
+- **工具结果里的内联图片现在也会上传**：`function_call_output` / `custom_tool_call_output` 的 `output` 数组里的 `data:` 内联图片与用户消息里的图片一样上传并回填 `file_id`（此前被整条跳过，模型看不到图）。
+- **上传前整请求预检（避免中途失败留下孤儿附件）**：一次请求 ≤20 张内联图片、单图解码后 ≤20 MiB、累计 ≤32 MiB、解码后 ≤64 MP；声明了标准库有解码器的类型却读不出图片头，按"内容与声明不符"拒绝；声明了标准库没有解码器的格式（例如 webp）不再被误拒（体积上限仍然生效）。
+- **`file_id` 与 `detail` 收紧**：上传返回的 `openai_file_id` 必须符合 `file-` 前缀 + 6..256 长度 + `[A-Za-z0-9_-]` 字符集，否则报 `invalid_attachment_response`；`detail` 有值就保留，且只接受 `auto|low|high|original`，缺失时才补 `auto`。
+- 诊断计数（`input_images`）现在也统计工具结果里的图片。
+- 明确**不做**：relay 模式与 `excel_bps_image_mode` 一类服务端设置、附件缓存 TTL/并发在途上限、`file-preflight` 占位；`arguments_schema_mismatch` 仍然进入纠错循环（提示里明确"只修 schema 拒绝的参数字段，不许替换模型已经产生的命令或载荷"）；codex/Claude 格式仍然不开增量流。
+
 ## v0.1.14-pro.3 — 2026-09-26（fork，未发布）
 
 第一批跟进上游 v0.1.15–v0.1.18 与 sub2api v2.8.16 的"能力/校验边界"，都属于少踩坑那一类，不改交付语义：

@@ -7,6 +7,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -18,6 +22,14 @@ import (
 
 // 只缓存摘要和文件 ID，不保存图片或凭据；容量不限制单次请求的图片数量。
 const maxAttachmentCacheEntries = 512
+
+// 上传前的整体预检上限：全部校验通过后才开始上传，避免失败时留下孤儿附件。
+const (
+	maxRequestInlineImages = 20
+	maxInlineImageBytes    = 20 << 20
+	maxRequestInlineBytes  = 32 << 20
+	maxInlineImagePixels   = 64 << 20
+)
 
 type cachedAttachment struct {
 	key    [sha256.Size]byte
@@ -120,18 +132,97 @@ func attachmentURL(responsesURL string) (string, error) {
 	return base.ResolveReference(&url.URL{Path: "attachments"}).String(), nil
 }
 
+// inlineImageField 返回条目中可能承载 input_image 的数组字段；空串表示该条目不能包含图片。
+func inlineImageField(item map[string]any) string {
+	switch stringValue(item["type"]) {
+	case "", "message":
+		return "content"
+	case "function_call_output", "custom_tool_call_output":
+		return "output"
+	default:
+		return ""
+	}
+}
+
+// validateImageDetail 只接受官方 detail 枚举；缺失时由上传逻辑补 "auto"。
+func validateImageDetail(value any) error {
+	if value == nil {
+		return nil
+	}
+	switch stringValue(value) {
+	case "auto", "low", "high", "original":
+		return nil
+	default:
+		return fail(400, "invalid_image", "input_image detail must be one of auto, low, high, original")
+	}
+}
+
+// validateInlineImage 只读图片头校验体积、格式与像素，不做完整解码以免内存放大。
+// 标准库只注册了 png/jpeg/gif 三种解码器：声明了没有解码器的格式（例如 webp）时读不出图片头，
+// 这种情况保留体积与 base64 校验、跳过格式与像素校验，不因为本插件认不出格式就判废请求；
+// 声明了有解码器的类型却读不出头，仍然按"内容与声明不符"拒绝。
+var decodedImageFormats = map[string]bool{
+	"image/png":  true,
+	"image/jpeg": true,
+	"image/gif":  true,
+}
+
+func validateInlineImage(attachment inlineImage) error {
+	if len(attachment.data) > maxInlineImageBytes {
+		return fail(400, "invalid_image", "input_image exceeds the 20 MiB decoded size limit")
+	}
+	config, format, err := image.DecodeConfig(bytes.NewReader(attachment.data))
+	if err != nil {
+		if err == image.ErrFormat && !decodedImageFormats[attachment.mediaType] {
+			return nil
+		}
+		return fail(400, "invalid_image", "input_image data is not a decodable image")
+	}
+	if "image/"+format != attachment.mediaType {
+		return fail(400, "invalid_image", "input_image data does not match its declared media type")
+	}
+	if config.Width <= 0 || config.Height <= 0 || int64(config.Width)*int64(config.Height) > maxInlineImagePixels {
+		return fail(400, "invalid_image", "input_image dimensions exceed the 64 megapixel limit")
+	}
+	return nil
+}
+
+type pendingImageUpload struct {
+	item  int
+	field string
+	index int
+	part  map[string]any
+	image inlineImage
+}
+
+// uploadInputImages 先对请求里所有内联图片做一次整体校验（张数、单图体积、累计体积、像素），
+// 只有全部通过才逐个上传，避免中途失败留下已上传的孤儿附件。
+// 用户消息与工具结果（function_call_output/custom_tool_call_output）的数组字段参与处理，
+// assistant 消息与不带 data: 前缀的 HTTPS URL 保持原样。
 func (s *Service) uploadInputImages(request ExecutorRequest, body map[string]any, c credential, cfg Config) error {
 	items, _ := body["input"].([]any)
+	var pending []pendingImageUpload
+	totalBytes := 0
 	for i, value := range items {
 		item := objectValue(value)
-		itemType := stringValue(item["type"])
-		if stringValue(item["role"]) != "user" || (itemType != "" && itemType != "message") {
+		if item == nil {
 			continue
 		}
-		parts, _ := item["content"].([]any)
-		var updated []any
+		field := inlineImageField(item)
+		if field == "" {
+			continue
+		}
+		// assistant 历史消息里的图片保持原样：上游不接受 assistant 消息内的 input_image，
+		// 只处理用户/系统消息与工具结果。
+		if field == "content" && stringValue(item["role"]) == "assistant" {
+			continue
+		}
+		parts, _ := item[field].([]any)
 		for j, value := range parts {
 			part := objectValue(value)
+			if part == nil {
+				continue
+			}
 			imageURL := stringValue(part["image_url"])
 			if stringValue(part["type"]) != "input_image" || len(imageURL) < 5 || !strings.EqualFold(imageURL[:5], "data:") {
 				continue
@@ -139,60 +230,83 @@ func (s *Service) uploadInputImages(request ExecutorRequest, body map[string]any
 			if stringValue(part["file_id"]) != "" {
 				return fail(400, "invalid_image", "input_image cannot contain both image_url and file_id")
 			}
-			image, err := decodeInlineImage(imageURL)
+			if err := validateImageDetail(part["detail"]); err != nil {
+				return err
+			}
+			if len(pending) >= maxRequestInlineImages {
+				return fail(400, "invalid_image", fmt.Sprintf("a request may contain at most %d inline images", maxRequestInlineImages))
+			}
+			attachment, err := decodeInlineImage(imageURL)
 			if err != nil {
 				return err
 			}
-			endpoint, err := attachmentURL(cfg.ResponsesURL)
-			if err != nil {
+			totalBytes += len(attachment.data)
+			if totalBytes > maxRequestInlineBytes {
+				return fail(400, "invalid_image", "inline images exceed the 32 MiB per-request limit")
+			}
+			if err := validateInlineImage(attachment); err != nil {
 				return err
 			}
-			hash := sha256.New()
-			_, _ = hash.Write(jsonBytes([]string{endpoint, c.AccountID, c.AuthMode, c.AccessToken, image.mediaType}))
-			_, _ = hash.Write(image.data)
-			var key [sha256.Size]byte
-			copy(key[:], hash.Sum(nil))
-			fileID, err := s.attachments.getOrUpload(key, func() (string, error) {
-				return s.uploadImage(request, endpoint, image, c)
-			})
-			if err != nil {
-				return err
-			}
-			if updated == nil {
-				updated = append([]any(nil), parts...)
-			}
-			copy := cloneObject(part)
-			delete(copy, "image_url")
-			copy["file_id"] = fileID
-			if _, exists := copy["detail"]; !exists {
-				copy["detail"] = "auto"
-			}
-			updated[j] = copy
+			pending = append(pending, pendingImageUpload{item: i, field: field, index: j, part: part, image: attachment})
 		}
-		if updated != nil {
-			copy := cloneObject(item)
-			copy["content"] = updated
-			items[i] = copy
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	endpoint, err := attachmentURL(cfg.ResponsesURL)
+	if err != nil {
+		return err
+	}
+	updated := make(map[int][]any)
+	fields := make(map[int]string)
+	for _, upload := range pending {
+		hash := sha256.New()
+		_, _ = hash.Write(jsonBytes([]string{endpoint, c.AccountID, c.AuthMode, c.AccessToken, upload.image.mediaType}))
+		_, _ = hash.Write(upload.image.data)
+		var key [sha256.Size]byte
+		copy(key[:], hash.Sum(nil))
+		fileID, err := s.attachments.getOrUpload(key, func() (string, error) {
+			return s.uploadImage(request, endpoint, upload.image, c)
+		})
+		if err != nil {
+			return err
 		}
+		if updated[upload.item] == nil {
+			original, _ := objectValue(items[upload.item])[upload.field].([]any)
+			updated[upload.item] = append([]any(nil), original...)
+			fields[upload.item] = upload.field
+		}
+		part := cloneObject(upload.part)
+		delete(part, "image_url")
+		part["file_id"] = fileID
+		if _, exists := part["detail"]; !exists {
+			part["detail"] = "auto"
+		}
+		updated[upload.item][upload.index] = part
+	}
+	for index, parts := range updated {
+		item := cloneObject(objectValue(items[index]))
+		item[fields[index]] = parts
+		items[index] = item
 	}
 	return nil
 }
 
-func (s *Service) uploadImage(request ExecutorRequest, endpoint string, image inlineImage, c credential) (string, error) {
+func (s *Service) uploadImage(request ExecutorRequest, endpoint string, attachment inlineImage, c credential) (string, error) {
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	filename := "image"
-	if extensions, _ := mime.ExtensionsByType(image.mediaType); len(extensions) > 0 {
+	if extensions, _ := mime.ExtensionsByType(attachment.mediaType); len(extensions) > 0 {
 		filename += extensions[0]
 	}
 	partHeaders := make(textproto.MIMEHeader)
 	partHeaders.Set("Content-Disposition", mime.FormatMediaType("form-data", map[string]string{"name": "file", "filename": filename}))
-	partHeaders.Set("Content-Type", image.mediaType)
+	partHeaders.Set("Content-Type", attachment.mediaType)
 	part, err := writer.CreatePart(partHeaders)
 	if err != nil {
 		return "", fail(500, "attachment_encoding", "cannot encode image attachment")
 	}
-	if _, err := part.Write(image.data); err != nil {
+	if _, err := part.Write(attachment.data); err != nil {
 		return "", fail(500, "attachment_encoding", "cannot write image attachment")
 	}
 	if err := writer.Close(); err != nil {
@@ -208,26 +322,45 @@ func (s *Service) uploadImage(request ExecutorRequest, endpoint string, image in
 		"headers":          headers,
 		"body":             body.Bytes(),
 	}, &response); err != nil {
-		return "", fail(502, "attachment_transport", "Basis Points attachment upload transport failed: "+attachmentErrorMessage([]byte(err.Error()), c, image))
+		return "", fail(502, "attachment_transport", "Basis Points attachment upload transport failed: "+attachmentErrorMessage([]byte(err.Error()), c, attachment))
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return "", fail(response.StatusCode, "attachment_upload_error", fmt.Sprintf("Basis Points attachment upload HTTP %d: %s", response.StatusCode, attachmentErrorMessage(response.Body, c, image)))
+		return "", fail(response.StatusCode, "attachment_upload_error", fmt.Sprintf("Basis Points attachment upload HTTP %d: %s", response.StatusCode, attachmentErrorMessage(response.Body, c, attachment)))
 	}
 	var result struct {
 		FileID string `json:"openai_file_id"`
 	}
-	if json.Unmarshal(response.Body, &result) != nil || strings.TrimSpace(result.FileID) == "" {
+	if json.Unmarshal(response.Body, &result) != nil {
 		return "", fail(502, "invalid_attachment_response", "Basis Points attachment upload returned no openai_file_id")
 	}
-	return strings.TrimSpace(result.FileID), nil
+	fileID := strings.TrimSpace(result.FileID)
+	if !validAttachmentID(fileID) {
+		return "", fail(502, "invalid_attachment_response", "Basis Points attachment upload returned an invalid openai_file_id")
+	}
+	return fileID, nil
 }
 
-func attachmentErrorMessage(raw []byte, c credential, image inlineImage) string {
+func attachmentErrorMessage(raw []byte, c credential, attachment inlineImage) string {
 	message := string(raw)
-	for _, secret := range []string{c.AccessToken, c.AccountID, c.Email, base64.StdEncoding.EncodeToString(image.data), string(image.data)} {
+	for _, secret := range []string{c.AccessToken, c.AccountID, c.Email, base64.StdEncoding.EncodeToString(attachment.data), string(attachment.data)} {
 		if secret != "" {
 			message = strings.ReplaceAll(message, secret, "[REDACTED]")
 		}
 	}
 	return redactTokenMessage(errorMessage([]byte(message)))
+}
+
+// validAttachmentID 只接受官方附件接口返回的 file_id 形态，拒绝静默透传畸形 ID。
+func validAttachmentID(id string) bool {
+	if len(id) < 6 || len(id) > 256 || !strings.HasPrefix(id, "file-") {
+		return false
+	}
+	for _, ch := range id[5:] {
+		switch {
+		case ch >= 'a' && ch <= 'z', ch >= 'A' && ch <= 'Z', ch >= '0' && ch <= '9', ch == '-', ch == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }

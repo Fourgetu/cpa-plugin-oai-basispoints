@@ -27,6 +27,9 @@ const (
 // functionCodeMarkerPrefix 是"原始代码直传"的形态标记前缀（见 functionCodeMarker）。
 const functionCodeMarkerPrefix = "codex2api.function_code/"
 
+// functionCmdMarkerPrefix 是"命令原文直传"的形态标记前缀（见 functionCmdMarker）。
+const functionCmdMarkerPrefix = "codex2api.function_cmd/"
+
 type toolSpec struct {
 	Key       string
 	Name      string
@@ -162,6 +165,10 @@ func clientToolProtocolInstructions(source map[string]any) string {
 				codeTools++
 				line += ". Its code parameter carries source text: set summary to " + functionCodeMarker(spec.Key) + ", put that source directly in code and put its other arguments as one JSON object in extended_summary."
 			}
+			if supportsFunctionCmdTransport(spec) {
+				codeTools++
+				line += ". Its cmd parameter is a shell command: set summary to " + functionCmdMarker(spec.Key) + ", put that command directly in code and put its other arguments as one JSON object in extended_summary."
+			}
 		} else {
 			line += ". It receives raw text in input."
 			if format := objectValue(spec.Spec["format"]); format != nil {
@@ -251,6 +258,9 @@ func clientToolProtocolReminder(source map[string]any) string {
 		}
 		if supportsFunctionCodeTransport(spec) {
 			reminder += " Function tool " + name + " takes source text: set summary to " + functionCodeMarker(spec.Key) + ", keep that source raw in code and put its other arguments as one JSON object in extended_summary."
+		}
+		if supportsFunctionCmdTransport(spec) {
+			reminder += " Function tool " + name + " takes a shell command: set summary to " + functionCmdMarker(spec.Key) + ", keep that command raw in code and put its other arguments as one JSON object in extended_summary."
 		}
 	}
 	return reminder
@@ -420,6 +430,28 @@ func fallbackTransportCall(item map[string]any, spec toolSpec) map[string]any {
 					"summary":          functionCodeMarker(name),
 					"extended_summary": string(jsonBytes(extra)),
 					"code":             code,
+					"destructive":      false,
+					"references":       []any{name},
+				})
+			}
+		}
+	}
+
+	// cmd 参数是字符串的 exec_command 一族走"命令原文直传"：命令原文进 code、其余参数进
+	// extended_summary，历史回放不必把带引号的命令行再转义一层。
+	if supportsFunctionCmdTransport(spec) {
+		if args := parseArguments(item["arguments"]); args != nil {
+			if command, ok := args["cmd"].(string); ok {
+				extra := make(map[string]any, len(args))
+				for property, value := range args {
+					if property != "cmd" {
+						extra[property] = value
+					}
+				}
+				return transportCallItem(callID, map[string]any{
+					"summary":          functionCmdMarker(name),
+					"extended_summary": string(jsonBytes(extra)),
+					"code":             command,
 					"destructive":      false,
 					"references":       []any{name},
 				})
@@ -816,6 +848,22 @@ func functionCodeMarkedTool(arguments map[string]any) (string, bool) {
 	return strings.TrimPrefix(summary, functionCodeMarkerPrefix), true
 }
 
+// functionCmdMarker 是"命令原文直传"的形态标记：写在 summary 里、指向该函数工具的完整目录名。
+// 与 function_code 同族，但对应 cmd 参数的 exec_command 一族：命令原文进 code、其余参数进
+// extended_summary；中转不解析、不修复、不评估这段命令，也不把它当成另一个工具调用。
+func functionCmdMarker(name string) string {
+	return functionCmdMarkerPrefix + name
+}
+
+// functionCmdMarkedTool 取出 summary 里的命令原文标记；没有标记说明这一条不是这种形态。
+func functionCmdMarkedTool(arguments map[string]any) (string, bool) {
+	summary, ok := arguments["summary"].(string)
+	if !ok || !strings.HasPrefix(summary, functionCmdMarkerPrefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(summary, functionCmdMarkerPrefix), true
+}
+
 func parseArguments(value any) map[string]any {
 	object, _ := parseRelayObject(value)
 	return object
@@ -1005,6 +1053,21 @@ func extractNativeClientToolCall(native map[string]any, specs map[string]toolSpe
 			return nil, relayError("function_code_marker_requires_code_tool")
 		}
 		raw, err := functionCodeArguments(spec, arguments)
+		if err != nil {
+			return nil, err
+		}
+		result["arguments"] = stringValue(raw["arguments"])
+		result["status"] = "completed"
+		return result, nil
+	}
+	if marked, present := functionCmdMarkedTool(arguments); present {
+		if marked != key {
+			return nil, relayError("function_cmd_marker_names_another_tool")
+		}
+		if spec.Type == "custom" || !supportsFunctionCmdTransport(spec) {
+			return nil, relayError("function_cmd_marker_requires_cmd_tool")
+		}
+		raw, err := functionCmdArguments(spec, arguments)
 		if err != nil {
 			return nil, err
 		}
@@ -1324,6 +1387,36 @@ func relayDiagnostic(native map[string]any, specs map[string]toolSpec) string {
 		}
 		return "function_code_payload_unusable"
 	}
+	if marked, present := functionCmdMarkedTool(arguments); present {
+		if marked != key {
+			return "function_cmd_marker_names_another_tool"
+		}
+		if spec.Type == "custom" || !supportsFunctionCmdTransport(spec) {
+			return "function_cmd_marker_requires_cmd_tool"
+		}
+		metadata, ok := arguments["extended_summary"].(string)
+		if !ok {
+			return "function_cmd_requires_extended_summary"
+		}
+		extra, reason := parseRelayObject(metadata)
+		if reason != "" {
+			return "extended_summary " + reason
+		}
+		if duplicate, exists := extra["cmd"]; exists {
+			if duplicateText, isText := duplicate.(string); !isText || duplicateText != code {
+				return "function_cmd_duplicates_cmd_in_arguments"
+			}
+		}
+		if code == "" {
+			return "function_cmd_text_missing"
+		}
+		merged := cloneObject(extra)
+		merged["cmd"] = code
+		if !schemaMatches(merged, firstMap(spec.Spec, "parameters", "inputSchema", "input_schema")) {
+			return "arguments_schema_mismatch"
+		}
+		return "function_cmd_payload_unusable"
+	}
 	if spec.Type == "custom" {
 		// custom 正文按原文直传，没有可写坏的 JSON；走到这里说明是别的原因。
 		return "custom_payload_unusable"
@@ -1393,6 +1486,130 @@ func functionCodeArguments(spec toolSpec, arguments map[string]any) (map[string]
 		return nil, relayError("arguments_schema_mismatch")
 	}
 	return map[string]any{"arguments": string(jsonBytes(merged))}, nil
+}
+
+// supportsFunctionCmdTransport 判断目录工具能不能走"命令原文直传"：必须是 exec_command 一族、
+// schema 明确声明了 string 类型的 cmd 参数，且不满足"原始代码直传"（两者都成立时 function_code 优先）。
+func supportsFunctionCmdTransport(spec toolSpec) bool {
+	if spec.Type != "function" || spec.Key == "" || spec.Name == "" {
+		return false
+	}
+	if spec.Key != "exec_command" && !strings.HasSuffix(spec.Key, ".exec_command") {
+		return false
+	}
+	if supportsFunctionCodeTransport(spec) {
+		return false
+	}
+	if strings.ContainsAny(spec.Key, `/\`) || strings.ContainsAny(spec.Key, " \t\r\n") {
+		return false
+	}
+	schema := firstMap(spec.Spec, "parameters", "inputSchema", "input_schema")
+	if schema == nil || stringValue(schema["type"]) != "object" {
+		return false
+	}
+	properties := objectValue(schema["properties"])
+	if properties == nil {
+		return false
+	}
+	cmd := objectValue(properties["cmd"])
+	return cmd != nil && stringValue(cmd["type"]) == "string"
+}
+
+// functionCmdArguments 解析"命令原文直传"形态（summary 带 codex2api.function_cmd/<工具名> 标记）：
+// code 是命令原文，extended_summary 是其余参数的一个 JSON 对象。中转只校验传输不变量：
+// 不解析、不修复、不评估这段命令，也不把它当成另一个工具调用。
+// 客户端才是完整 schema 的权威，多余或向前兼容的字段一律原样转交，不因此判废整条流。
+func functionCmdArguments(spec toolSpec, arguments map[string]any) (map[string]any, error) {
+	metadata, ok := arguments["extended_summary"].(string)
+	if !ok {
+		return nil, relayError("function_cmd_requires_extended_summary")
+	}
+	extra, reason := parseRelayObject(metadata)
+	if reason != "" {
+		return nil, relayError("extended_summary " + reason)
+	}
+	command, ok := arguments["code"].(string)
+	if !ok {
+		return nil, relayError("function_cmd_requires_code_text")
+	}
+	if command == "" {
+		return nil, relayError("function_cmd_text_missing")
+	}
+	if duplicate, exists := extra["cmd"]; exists {
+		duplicateText, isText := duplicate.(string)
+		if !isText || duplicateText != command {
+			return nil, relayError("function_cmd_duplicates_cmd_in_arguments")
+		}
+		// 上游有时把同一条命令在两个字段里重复一遍：只丢掉完全相同的副本，冲突值仍然拒绝。
+		delete(extra, "cmd")
+	}
+	merged := cloneObject(extra)
+	merged["cmd"] = command
+	if !schemaMatches(merged, firstMap(spec.Spec, "parameters", "inputSchema", "input_schema")) {
+		return nil, relayError("arguments_schema_mismatch")
+	}
+	return map[string]any{"arguments": string(jsonBytes(merged))}, nil
+}
+
+// isRawTransportArguments 判断外层参数是不是三种"裸载荷"形态之一：function_code / function_cmd
+// 看 summary 标记，custom 按 references 指向的目录工具类型判断（custom 没有标记）。
+func isRawTransportArguments(arguments map[string]any, specs map[string]toolSpec) bool {
+	if _, marked := functionCodeMarkedTool(arguments); marked {
+		return true
+	}
+	if _, marked := functionCmdMarkedTool(arguments); marked {
+		return true
+	}
+	if spec, exists := specs[transportTargetName(arguments)]; exists && spec.Type == "custom" {
+		return true
+	}
+	return false
+}
+
+// bindRawTransportPayloads 把模型原始发出的裸载荷字节绑回纠正后的条目。
+// 纠正只允许重排封装（换形态、挪参数、补 summary），不允许换掉"要执行的东西"：
+// 原本写坏的条目里，外层 code 就是模型给出的命令或源码原文，纠正后的载荷字段必须与它逐字一致。
+// 原本合法、或纠正后不是裸形态（普通 JSON 信封）的条目一律不动。
+// 返回新切片：改的是交付给客户端与历史回放的条目，模型响应本体不受影响。
+func bindRawTransportPayloads(original []map[string]any, corrected map[string]any, source map[string]any) map[string]any {
+	specs := callableClientToolSpecs(source)
+	result := cloneObject(corrected)
+	output, _ := result["output"].([]any)
+	if output == nil {
+		return result
+	}
+	positions := make([]int, 0, len(original))
+	for index, value := range output {
+		if item := objectValue(value); isToolItem(item) {
+			positions = append(positions, index)
+		}
+	}
+	next := append([]any(nil), output...)
+	for index := range original {
+		if index >= len(positions) {
+			break
+		}
+		if _, err := extractNativeClientToolCall(original[index], specs); err == nil {
+			continue
+		}
+		beforeArgs, _ := parseRelayObject(original[index]["arguments"])
+		payload := stringValue(beforeArgs["code"])
+		if payload == "" {
+			continue
+		}
+		position := positions[index]
+		afterArgs, _ := parseRelayObject(objectValue(next[position])["arguments"])
+		if !isRawTransportArguments(afterArgs, specs) || stringValue(afterArgs["code"]) == payload {
+			continue
+		}
+		bound := cloneObject(afterArgs)
+		bound["code"] = payload
+		entry := cloneObject(objectValue(next[position]))
+		entry["arguments"] = string(jsonBytes(bound))
+		next[position] = entry
+	}
+	result["output"] = next
+	return result
 }
 
 // syntheticFailureStream 生成"以内联失败结束"的 SSE 流。
@@ -1810,14 +2027,17 @@ const maxToolRepairs = 2
 const toolRepairFeedbackCode = "invalid_client_tool_transport"
 
 // toolRepairHint 是纠错追问里给模型的指令：只讲封装格式，不解释代码、不推断目标。
-const toolRepairHint = "The preceding tool batch failed transport validation before any client tool was executed. Correct only its transport formatting: return exactly %d run_officejs calls, in the same order, for the same client tools, preserving the intended operations and any raw payload byte for byte. Route with outer references containing exactly one catalog tool name and put only that tool's payload in code (a JSON arguments object for function tools, unchanged raw input for custom tools). For a function tool whose catalog line says its code parameter carries source text, also set summary to that tool's codex2api.function_code marker and put its other arguments as one JSON object in extended_summary. Do not execute Office code, do not add operations, do not repeat commentary."
+const toolRepairHint = "The preceding tool batch failed transport validation before any client tool was executed. Correct only its transport formatting: return exactly %d run_officejs calls, in the same order, for the same client tools, preserving the intended operations and any raw payload byte for byte. Route with outer references containing exactly one catalog tool name and put only that tool's payload in code (a JSON arguments object for function tools, unchanged raw input for custom tools). For a function tool whose catalog line says its code parameter carries source text, also set summary to that tool's codex2api.function_code marker and put its other arguments as one JSON object in extended_summary. For a function tool whose catalog line says its cmd parameter is a shell command, also set summary to that tool's codex2api.function_cmd marker, keep that command raw in code and put its other arguments as one JSON object in extended_summary. Fix only the transport and the argument fields the schema rejected: never replace the command or payload the model already produced. Do not execute Office code, do not add operations, do not repeat commentary."
 
 // toolRepairFunc 用同一凭据、同一会话再向 BPS 要一次修正结果；此时整个工具批次仍未执行。
 type toolRepairFunc func(response map[string]any, validation error) (map[string]any, error)
 
-// transportTargetName 取外层参数声明的目标工具：function_code 标记优先，其次是 references。
+// transportTargetName 取外层参数声明的目标工具：function_code / function_cmd 标记优先，其次是 references。
 func transportTargetName(arguments map[string]any) string {
 	if marked, present := functionCodeMarkedTool(arguments); present {
+		return marked
+	}
+	if marked, present := functionCmdMarkedTool(arguments); present {
 		return marked
 	}
 	if references, ok := arguments["references"].([]any); ok && len(references) == 1 {
@@ -1922,6 +2142,12 @@ func preservesTransportOperations(before, after []map[string]any, source map[str
 			return false
 		}
 		if spec, exists := specs[target]; exists && spec.Type == "custom" {
+			if stringValue(afterArgs["code"]) != stringValue(beforeArgs["code"]) {
+				return false
+			}
+		}
+		// 命令原文形态同样在外层 code 里：纠正后必须逐字保留，否则等于换了要执行的命令。
+		if _, marked := functionCmdMarkedTool(afterArgs); marked {
 			if stringValue(afterArgs["code"]) != stringValue(beforeArgs["code"]) {
 				return false
 			}
@@ -2124,6 +2350,13 @@ func (b *toolStreamBridge) repairTransportBatch(response map[string]any) (map[st
 			// 模型没改对（或改得更糟）：换下一轮追问。
 			validation, failed = nextValidation, corrected
 			continue
+		}
+		// 纠正可以重排封装，但不能换掉已发出的操作正文：先把原始的裸载荷字节绑回纠正后的条目，
+		// 再按绑回结果复算一次（绑回不会把原本合法的批次改坏）。
+		corrected = bindRawTransportPayloads(original, corrected, b.source)
+		items, ok = repairableTransportBatch(corrected, b.source)
+		if !ok || len(items) != len(original) {
+			return nil, false
 		}
 		if _, _, _, checkErr := transformResponseBodyPassThrough(jsonBytes(corrected), b.source); checkErr != nil {
 			// 纠正后的批次还有策略冲突（目录外目标等）：不采用，也不再追问。

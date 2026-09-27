@@ -284,7 +284,12 @@ func upstreamRequestError(status int, raw []byte, body map[string]any, c credent
 	images, originalDetails := 0, 0
 	items, _ := body["input"].([]any)
 	for _, value := range items {
-		parts, _ := objectValue(value)["content"].([]any)
+		entry := objectValue(value)
+		field := inlineImageField(entry)
+		if field == "" {
+			continue
+		}
+		parts, _ := entry[field].([]any)
 		for _, part := range parts {
 			if stringValue(objectValue(part)["type"]) == "input_image" {
 				images++

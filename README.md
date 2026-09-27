@@ -1,6 +1,6 @@
 # CPA OpenAI Basis Points 插件
 
-> 本仓库是 [Fourgetu](https://github.com/Fourgetu) 的 fork：基线为上游 v0.1.14，版本号 `0.1.14-pro.3`。相对上游的改动、分流条件与取舍见 [FORK-NOTES.md](FORK-NOTES.md)，更新日志见 [CHANGELOG.md](CHANGELOG.md)。上游代码、MIT 许可证与版权声明原样保留。
+> 本仓库是 [Fourgetu](https://github.com/Fourgetu) 的 fork：基线为上游 v0.1.14，版本号 `0.1.14-pro.4`。相对上游的改动、分流条件与取舍见 [FORK-NOTES.md](FORK-NOTES.md)，更新日志见 [CHANGELOG.md](CHANGELOG.md)。上游代码、MIT 许可证与版权声明原样保留。
 这是一个 CLIProxyAPI（CPA）原生插件，用 CPA 已有的 ChatGPT/Codex OAuth 凭据直接请求。
 
 ## 通过 CPA 插件商店安装（推荐）
@@ -8,7 +8,7 @@
 在管理界面的「第三方插件源 → 插件源 registry URL (plugins.store-sources)」中添加以下地址并保存，然后刷新插件商店，搜索 **CPA OpenAI Basis Points**：
 
 ```text
-https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/v0.1.14-pro.3/registry.json
+https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/v0.1.14-pro.4/registry.json
 ```
 
 也可合并到 CPA **宿主配置**（`config.yaml`，与下方插件配置共用同一个 `plugins` 节点）：
@@ -17,7 +17,7 @@ https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/v0.1.14-pr
 plugins:
   enabled: true
   store-sources:
-    - https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/v0.1.14-pro.3/registry.json
+    - https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/v0.1.14-pro.4/registry.json
 ```
 
 保留已有插件源，不要整体覆盖原有 `plugins` 配置；内置官方源由 CPA 自动保留。本源使用宿主原生的 `github-release` 安装方式，最新版本以本仓库已发布的 GitHub Release 为准，不在 registry 中另行维护版本号。CPA 会按运行平台下载 `oai-basispoints_<version>_<goos>_<goarch>.zip`，并使用同一 Release 的 `checksums.txt` 校验。本仓库的 `main` 分支就是本 fork 的默认分支，内容与最新 tag 一致（只多文档更新）；想跟随最新代码也可以用 `https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/main/registry.json`，上面的 tag 地址则用于钉住具体版本。
@@ -35,6 +35,8 @@ plugins:
 | 3 | 协议错误内联交付（流内 `response.failed`、非流式 `status=failed`，HTTP 200） | 协议问题是模型/客户端的问题，不是账号故障；以 5xx 交给 CPA 会把凭据冷却，形成"503 墙" |
 | 4 | 原生 Responses 客户端（`Format == "openai-response"`）走增量流式桥 + 15s SSE 保活 | 上游是"先读完上游 SSE 再整体回放"，长回合下游零字节会被 Cloudflare 524；本分支文本事件到达即下发（实测首字节 13.9s → 2.0s、`output_text.delta` 0 → 572~615） |
 | 5 | `code` 参数声明为 string 的函数工具支持"原始代码直传"：`summary` 放 `codex2api.function_code/<工具名>` 标记、`code` 放源码原文、其余参数作为一个 JSON 对象放 `extended_summary` | 这类工具（如 `mcp__cua_repl.js`）的正文是源码，按普通函数形状塞进 `code` 的 JSON 对象里要二次转义；形态约定沿用 hloolx/codex2api（经 ranxi2001/sub2api 的 BPS 协议包对照） |
+| 6 | `exec_command` 一族（`cmd` 参数声明为 string）支持"命令原文直传"：`summary` 放 `codex2api.function_cmd/<工具名>` 标记、命令原文进 `code`、其余参数作为一个 JSON 对象放 `extended_summary` | 命令正文按普通函数形状塞进 `code` 的 JSON 对象里同样要二次转义；中转只校验传输不变量（不解析/不修复/不评估命令），形态约定沿用 hloolx/codex2api，经 ranxi2001/sub2api 的 BPS 协议实践对照 |
+| 7 | 工具结果的内联图片（`function_call_output` / `custom_tool_call_output` 的 `output` 数组里的 `data:`）现在也上传并回填 `file_id`；上传前做整请求预检（≤20 张、单图解码后 ≤20 MiB、累计 ≤32 MiB、解码后 ≤64 MP），并收紧 `file_id`（`file-` 前缀 + 6..256 + `[A-Za-z0-9_-]`）与 `detail`（`auto\|low\|high\|original`）校验 | 此前工具结果里的图片被整条跳过、模型看不到图；预检避免上传中途失败留下孤儿附件 |
 
 此外还有两处收紧，属于本分支对放行策略的加固：
 

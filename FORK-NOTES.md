@@ -1,7 +1,7 @@
-# Fourgetu fork 说明（分支 `prod/v0.1.14`，版本 `0.1.14-pro.3`）
+# Fourgetu fork 说明（分支 `prod/v0.1.14`，版本 `0.1.14-pro.4`）
 
 本仓库是 [JaxsonWang/cpa-plugin-oai-basispoints](https://github.com/JaxsonWang/cpa-plugin-oai-basispoints) 的 fork，发布在 [Fourgetu/cpa-plugin-oai-basispoints](https://github.com/Fourgetu/cpa-plugin-oai-basispoints)。
-分支 `prod/v0.1.14` 以上游 **v0.1.14**（commit `1b9359a`）为基线，版本号 `0.1.14-pro.3`（与 tag 一致）。在上游之上保留五处生产验证过的改动、一组有界的工具封装纠错（对齐 sub2api v2.8.15），以及一组能力/校验边界（对齐上游 v0.1.15–v0.1.18 与 sub2api v2.8.16，见第 8 节）。
+分支 `prod/v0.1.14` 以上游 **v0.1.14**（commit `1b9359a`）为基线，版本号 `0.1.14-pro.4`（与 tag 一致）。在上游之上保留五处生产验证过的改动、一组有界的工具封装纠错（对齐 sub2api v2.8.15）、一组能力/校验边界（对齐上游 v0.1.15–v0.1.18 与 sub2api v2.8.16，见第 8 节），以及命令原文直传与附件预检一组（对齐 sub2api 的 BPS 协议实践，见第 9、10 节）。
 
 除本文列出的差异外，其余行为与 v0.1.14 一致；上游代码、MIT 许可证与版权声明原样保留。
 
@@ -96,3 +96,25 @@ docker run --rm -v "$PWD":/src -w /src golang:1.26 sh -c '
 - **模型目录**：插件别名按同一目录里的规范模型同步 `apply_patch_tool_type`（规范模型没声明就删掉别名旧值）；删掉 `multi_agent_version` / `multi_agent_reasoning_effort`；`experimental_supported_tools` 只保留 `clock`、`send_user_message_async`，列表非法时 502。
 - **入站拒绝**：结构化 `text.format`（`json_object`/`json_schema`）与 `agent_message` 里的 `encrypted_content` 都在调上游前 400，不静默降级、不猜解密；既有 `reasoning` 密文的处理不变。
 - **密文恢复**：BPS 明确返回 `invalid_encrypted_content` 时，只丢不透明 `reasoning`、用同一凭据同路重发一次；不丢其它位置的密文，普通 400/5xx 不重放。
+
+## 9. `exec_command` 命令原文直传与"纠错只重排封装"（0.1.14-pro.4 起）
+
+沿用第 3 节第 3 种形态的思路，`exec_command` 一族（`cmd` 参数声明为 string）也支持"命令原文直传"：`summary` 放标记 `codex2api.function_cmd/<完整工具名>`、命令原文进 `code`、其余参数作为一个 JSON 对象放 `extended_summary`。与 `codex2api.function_code/` 的差别只有标记串与所指向的工具族不同，判别同样只看 `summary` 标记。
+
+中转对这段命令只校验"传输不变量"：不解析、不修复、不评估它，也不把它当成另一个工具调用。客户端仍是参数 schema 的权威，模型多写或写了向前兼容的字段不因此判废整条流。目录说明与纠错提示同步教会模型这个形态；历史回放会把已执行调用重新编码成同一形态。
+
+配套的纠错收紧：纠错后条目里"由模型原始发出的裸载荷字节"会被绑回，覆盖 `custom` / `function_code` / `function_cmd` 三种裸形态——换了命令或载荷正文的"纠正"一律不采用。原本合法、或原始 `code` 本身就是 JSON 信封的条目不受影响。`arguments_schema_mismatch` 仍然进入纠错循环，提示里明确"只修 schema 拒绝的参数字段，不许替换模型已经产生的命令或载荷"。
+
+**局限（已知残余风险）**：这种绑回只覆盖"原本就是裸形态（`custom` / `function_code` / `function_cmd`）"的条目。模型若在纠错时改用普通 JSON 信封形态（外层无标记）并把载荷换成别的内容，仍会被当作合法修复放行——这与参考实现 sub2api 的边界相同，属于已知残余风险；真要堵需要在"普通形态"下比较解码后的 `code`/`cmd` 字段，但那会挡掉正常的参数修复通道，故不做。
+
+## 10. 工具结果内联图片上传与整请求预检（0.1.14-pro.4 起）
+
+`function_call_output` / `custom_tool_call_output` 的 `output` 数组里的 `data:` 内联图片过去被整条跳过（模型看不到图）；现在与用户消息里的图片一样上传并回填 `file_id`，诊断计数（`input_images`）也一并统计它们。
+
+上传前新增整请求预检，避免上传中途失败留下孤儿附件：一次请求 ≤20 张内联图片、单图解码后 ≤20 MiB、累计 ≤32 MiB、解码后 ≤64 MP；声明了标准库有解码器的类型却读不出图片头，按"内容与声明不符"拒绝。`file_id` 与 `detail` 也收紧：上传返回的 `openai_file_id` 必须符合 `file-` 前缀 + 6..256 长度 + `[A-Za-z0-9_-]` 字符集，否则报 `invalid_attachment_response`；`detail` 有值就保留，且只接受 `auto|low|high|original`，缺失时才补 `auto`。
+
+**局限（已知边界）**：
+
+- 体积/像素校验对标准库没有解码器的格式（例如 webp）只保留体积上限，跳过格式与像素校验；声明了有解码器的类型却读不出头仍然拒绝。
+- 本插件**不做** relay 模式、服务端图片设置项（如 `excel_bps_image_mode`）、附件缓存 TTL 与并发在途上限、`file-preflight` 占位——那些是多用户网关的取向。
+- 仍然不做：回放缓存的字节上限/TTL、codex/Claude 格式的增量流式。

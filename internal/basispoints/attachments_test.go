@@ -303,27 +303,51 @@ func TestAttachmentCacheEvictsOldestAndDoesNotCacheFailures(t *testing.T) {
 	}
 }
 
-func TestImageUploadPreservesOtherInputKinds(t *testing.T) {
+func TestImageUploadRewritesToolOutputsAndPreservesOtherInputKinds(t *testing.T) {
 	dataURL, _ := testImageDataURL(t)
 	source := map[string]any{"input": []any{
 		map[string]any{"role": "user", "content": []any{
 			map[string]any{"type": "input_image", "file_id": "file-existing", "detail": "high"},
 			map[string]any{"type": "input_image", "image_url": "https://example.test/image.png", "detail": "auto"},
 		}},
-		map[string]any{"type": "function_call_output", "output": []any{map[string]any{"type": "input_image", "image_url": dataURL}}},
+		map[string]any{"type": "function_call_output", "call_id": "call-1", "output": []any{map[string]any{"type": "input_image", "image_url": dataURL}}},
+		map[string]any{"type": "custom_tool_call_output", "call_id": "call-2", "output": []any{map[string]any{"type": "input_image", "image_url": dataURL, "detail": "low"}}},
 		map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "input_image", "image_url": dataURL}}},
 	}}
-	before := string(jsonBytes(source))
 	service := NewService()
-	service.SetHost(func(string, any, any) error {
-		t.Error("unexpected upload or URL download")
-		return errors.New("unexpected host call")
+	uploads := 0
+	service.SetHost(func(_ string, _ any, out any) error {
+		uploads++
+		*out.(*upstreamResponse) = upstreamResponse{StatusCode: 200, Body: jsonBytes(map[string]any{"openai_file_id": "file-tool-output"})}
+		return nil
 	})
 	if err := service.uploadInputImages(ExecutorRequest{}, source, credential{}, defaultConfig()); err != nil {
 		t.Fatal(err)
 	}
-	if string(jsonBytes(source)) != before {
-		t.Fatal("modified existing ID, remote URL, or tool output")
+	items := source["input"].([]any)
+	userParts := objectValue(items[0])["content"].([]any)
+	if objectValue(userParts[0])["file_id"] != "file-existing" || objectValue(userParts[0])["detail"] != "high" {
+		t.Fatal("existing file ID or detail was modified")
+	}
+	if objectValue(userParts[1])["image_url"] != "https://example.test/image.png" {
+		t.Fatal("remote URL was modified")
+	}
+	for i, detail := range []string{"auto", "low"} {
+		toolOutput := objectValue(items[1+i])
+		part := objectValue(toolOutput["output"].([]any)[0])
+		if part["file_id"] != "file-tool-output" || part["image_url"] != nil || part["detail"] != detail {
+			t.Fatalf("tool output %d not rewritten: %#v", i, part)
+		}
+		if toolOutput["call_id"] != fmt.Sprintf("call-%d", i+1) {
+			t.Fatal("tool output identity changed")
+		}
+	}
+	assistant := objectValue(objectValue(items[3])["content"].([]any)[0])
+	if assistant["image_url"] != dataURL || assistant["file_id"] != nil {
+		t.Fatal("assistant image was uploaded")
+	}
+	if uploads != 1 {
+		t.Fatalf("uploads=%d, want 1 (identical inline images must deduplicate)", uploads)
 	}
 }
 

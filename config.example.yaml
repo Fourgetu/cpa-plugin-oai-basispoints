@@ -22,15 +22,21 @@ plugins:
       models:
         - gpt-6-astra-basispoints
         - gpt-5.6-sol-basispoints
+        - gpt-6-sol-basispoints
+        - gpt-6-luna-basispoints
 
       # 别名到实际上游模型的映射，支持任意数量，不限于本示例的两项。
       # 添加模型：在 models 中加入别名，再在此处添加「别名: 上游模型名」。
       # 移除模型：同时删除 models 中的别名及此处的对应映射。
       # 映射键必须已列入 models，键和值均不可为空；多个别名可指向同一上游。
-      # 示例只说明路由配置，实际可用模型及其参数取决于 Basis Points 和账号权限。
+      # 上游可用性（2026-09-28 实测，走插件真实链路）：gpt-6-astra / gpt-6-luna 可用；
+      # gpt-6-sol 可用但会撞组织级 TPM 限速；gpt-6-terra 未验证（BPS 侧此前不提供）。
+      # 实际可用模型与参数取决于 Basis Points 与账号权限，别名加/删只改这里即可。
       model_mappings:
         gpt-6-astra-basispoints: gpt-6-astra
         gpt-5.6-sol-basispoints: gpt-5.6-sol
+        gpt-6-sol-basispoints: gpt-6-sol
+        gpt-6-luna-basispoints: gpt-6-luna
 
       # 读取上游响应的超时时间，单位：秒；范围：10～1800，默认 300。
       timeout_seconds: 300

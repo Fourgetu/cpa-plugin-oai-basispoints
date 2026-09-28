@@ -57,7 +57,9 @@ plugins:
 ## 安装和配置
 
 1. 将 `build/linux/amd64/oai-basispoints.so` 复制到 CPA 的 Linux amd64 插件目录。
-2. 将 `config.example.yaml` 按需合并到 CPA 的 `config.yaml`；它是完整的宿主配置示例，不会由插件自动读取。插件内置默认暴露 `gpt-6-astra-basispoints`，示例同时配置 Astra 和 Sol，可继续增删模型。
+2. 将 `config.example.yaml` 按需合并到 CPA 的 `config.yaml`；它是完整的宿主配置示例，不会由插件自动读取。插件内置默认暴露 `gpt-6-astra-basispoints`，示例另外配置 `gpt-5.6-sol/luna/terra-basispoints`、`gpt-6-sol-basispoints`、`gpt-6-luna-basispoints`，可继续增删。模型名（客户端调用名）就是 `models` 里的别名，别名与上游模型的对应关系由 `model_mappings` 决定——**加/删模型只改配置，不需要改插件**。
+
+   上游可用性（2026-09-28 实测，走插件真实链路）：`gpt-6-astra`、`gpt-6-luna` 可用；`gpt-6-sol` 可用但会撞组织级 TPM 限速（`Rate limit reached ... on tokens per min (TPM)`，错峰可过）；`gpt-6-terra` 未验证（BPS 侧此前不提供）。可用模型与参数取决于 Basis Points 与账号权限。
 3. CPA 的 `auth-dir` 中已有的 `type: codex` OAuth 文件会被插件识别；插件只在内存中读取 token，不生成另一份 token 文件。
 4. 客户端使用 Responses 协议调用 `gpt-6-astra-basispoints`。模型目录声明图像输入，以及 `low`、`medium`、`high`、`xhigh`、`max`、`ultra` 思考等级；`max` 映射为 `xhigh`，`ultra` 原样传递，未指定时默认 `medium`。
 

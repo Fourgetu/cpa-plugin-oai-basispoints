@@ -217,3 +217,19 @@ docker run --rm -v "$PWD":/src -w /src golang:1.26 sh -c '
 - **体积/像素闸门不动**：单图解码后 ≤20 MiB、整请求累计 ≤32 MiB、解码后 ≤64 MP——真正约束上游请求体的是这三道；默认 512 张下它们仍先触发（1.27 MiB / 21 张这种历史离闸门很远，正是当初被张数卡死的原因）。
 - **测试**：`TestInlineImageLimitFollowsConfiguration`（0 回落默认并放行 21 张、配置值生效、超限 400 带实际数值）、`TestInlineImageLimitConfigValidation`（0 → 默认；-1 与 4097 → 400 `invalid_config`；上界放行）；`TestInlineImagePreflightRejectsBeforeAnyUpload` 的 count 用例改用默认上限构造 513 张。
 - **刻意没做**：不加"超限就从最老的历史截图开始丢弃"（方案 B）——超限仍报错，保持行为可解释；若长会话体积真的逼近 32 MiB 闸门再谈。
+
+## 15. 上游模型可用性实测（2026-09-28）
+
+方法：直连 `bps.openai.com` 手搓请求会被 BPS 以 `422 Invalid request body` 拒绝（连基线模型也一样，说明它对请求体有严格校验、我们复刻的形状不完整），所以改用**唯一可靠路径**——临时给插件配置加别名映射（`model_mappings`），走插件真实链路实测，测完按需保留/回滚。
+
+| 上游模型 | 结果 | 说明 |
+|---|---|---|
+| `gpt-6-astra` | ✅ 200，完整 SSE | 对照组 |
+| `gpt-6-luna` | ✅ 200，完整 SSE（2/2 次） | **现在可用**（此前探测为 403） |
+| `gpt-6-sol` | ⚠️ 上游受理但被 TPM 限速（2/2 次） | `event: response.created → response.in_progress → event: error`，`code=rate_limit_exceeded`：`Rate limit reached for gpt-6-sol in organization org-msnGs3IGIMHVb4KQfk72kh8y on tokens per min (TPM): Limit 40000000, Used 40000000, Requested 23038. Please try again in 34ms.` —— **组织级 TPM 配额**（不是 BPS 的 1000 次/分钟、也不是插件限制），错峰/稍后重试可过 |
+| `gpt-6-terra` | 未验证 | BPS 侧此前不提供；`/v1/models` 里只有 `gpt-5.6-terra`，没有 `gpt-6-terra` |
+
+- 客户端看到的模型名就是别名：`gpt-6-sol-basispoints` / `gpt-6-luna-basispoints`（`/v1/models` 返回 `{"id":"gpt-6-luna-basispoints","owned_by":"oai-basispoints"}`；插件注册表另外带 `Name` = 上游名、`DisplayName` = 别名）。
+- 加/删模型**只改 CPA 配置**（`models` + `model_mappings`），不需要改插件代码；示例见 `config.example.yaml`。
+- 生产侧本次改动：`/root/cpa/config.yaml` 增加这两个别名（备份 `config.yaml.bak-6sol-probe-20260928-151944`），热重载生效；回滚 = `bash /root/cpa/plugin-patched/vps_alias_probe_6sol.sh revert`。
+- 复核：改后 `vps_check_0222.sh` 通过（6 个别名、模型总数 65、冒烟 `ttfb 2465ms / total 3079ms / deltas 2 / failed 0`）。

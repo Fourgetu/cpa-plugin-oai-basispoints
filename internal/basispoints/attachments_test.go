@@ -303,12 +303,16 @@ func TestAttachmentCacheEvictsOldestAndDoesNotCacheFailures(t *testing.T) {
 	}
 }
 
+// 用户消息里的内联图片上传成附件引用；工具结果里的内联截图保留 data: 原样
+// （加载项原生形态，上传转附件引用会被上游以 422 拒绝）；既有的附件引用与
+// HTTPS URL、assistant 消息里的图片保持原样。
 func TestImageUploadRewritesToolOutputsAndPreservesOtherInputKinds(t *testing.T) {
 	dataURL, _ := testImageDataURL(t)
 	source := map[string]any{"input": []any{
 		map[string]any{"role": "user", "content": []any{
 			map[string]any{"type": "input_image", "file_id": "file-existing", "detail": "high"},
 			map[string]any{"type": "input_image", "image_url": "https://example.test/image.png", "detail": "auto"},
+			map[string]any{"type": "input_image", "image_url": dataURL},
 		}},
 		map[string]any{"type": "function_call_output", "call_id": "call-1", "output": []any{map[string]any{"type": "input_image", "image_url": dataURL}}},
 		map[string]any{"type": "custom_tool_call_output", "call_id": "call-2", "output": []any{map[string]any{"type": "input_image", "image_url": dataURL, "detail": "low"}}},
@@ -318,13 +322,16 @@ func TestImageUploadRewritesToolOutputsAndPreservesOtherInputKinds(t *testing.T)
 	uploads := 0
 	service.SetHost(func(_ string, _ any, out any) error {
 		uploads++
-		*out.(*upstreamResponse) = upstreamResponse{StatusCode: 200, Body: jsonBytes(map[string]any{"openai_file_id": "file-tool-output"})}
+		*out.(*upstreamResponse) = upstreamResponse{StatusCode: 200, Body: jsonBytes(map[string]any{"openai_file_id": "file-uploaded"})}
 		return nil
 	})
 	if err := service.uploadInputImages(ExecutorRequest{}, source, credential{}, defaultConfig()); err != nil {
 		t.Fatal(err)
 	}
 	items := source["input"].([]any)
+	if len(items) != 4 {
+		t.Fatalf("item count changed: %d", len(items))
+	}
 	userParts := objectValue(items[0])["content"].([]any)
 	if objectValue(userParts[0])["file_id"] != "file-existing" || objectValue(userParts[0])["detail"] != "high" {
 		t.Fatal("existing file ID or detail was modified")
@@ -332,11 +339,14 @@ func TestImageUploadRewritesToolOutputsAndPreservesOtherInputKinds(t *testing.T)
 	if objectValue(userParts[1])["image_url"] != "https://example.test/image.png" {
 		t.Fatal("remote URL was modified")
 	}
-	for i, detail := range []string{"auto", "low"} {
+	if uploaded := objectValue(userParts[2]); uploaded["file_id"] != "file-uploaded" || uploaded["image_url"] != nil || uploaded["detail"] != "auto" {
+		t.Fatalf("user inline image not uploaded: %#v", uploaded)
+	}
+	for i, detail := range []any{nil, "low"} {
 		toolOutput := objectValue(items[1+i])
 		part := objectValue(toolOutput["output"].([]any)[0])
-		if part["file_id"] != "file-tool-output" || part["image_url"] != nil || part["detail"] != detail {
-			t.Fatalf("tool output %d not rewritten: %#v", i, part)
+		if part["image_url"] != dataURL || part["file_id"] != nil || part["detail"] != detail {
+			t.Fatalf("tool output screenshot %d must stay verbatim: %#v", i, part)
 		}
 		if toolOutput["call_id"] != fmt.Sprintf("call-%d", i+1) {
 			t.Fatal("tool output identity changed")
@@ -347,7 +357,7 @@ func TestImageUploadRewritesToolOutputsAndPreservesOtherInputKinds(t *testing.T)
 		t.Fatal("assistant image was uploaded")
 	}
 	if uploads != 1 {
-		t.Fatalf("uploads=%d, want 1 (identical inline images must deduplicate)", uploads)
+		t.Fatalf("uploads=%d, want 1 (only the user message image)", uploads)
 	}
 }
 

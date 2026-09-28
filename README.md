@@ -1,6 +1,6 @@
 # CPA OpenAI Basis Points 插件
 
-> 本仓库是 [Fourgetu](https://github.com/Fourgetu) 的 fork：代码基线为上游 v0.1.14，版本号 `0.2.2-pro.1`（从本版起跟随上游版本线：0.2.2-pro.1 = 对齐上游 v0.2.2 时点的修复集，不含上游 v0.1.18 streaming 重写与 v0.2.0 WS 传输）。相对上游的改动、分流条件与取舍见 [FORK-NOTES.md](FORK-NOTES.md)，更新日志见 [CHANGELOG.md](CHANGELOG.md)。上游代码、MIT 许可证与版权声明原样保留。
+ > 本仓库是 [Fourgetu](https://github.com/Fourgetu) 的 fork：代码基线为上游 v0.1.14，版本号 `0.2.2-pro.2`（从 0.2.2-pro.1 起跟随上游版本线：0.2.2-pro.2 = 对齐上游 v0.2.2 时点的修复集，不含上游 v0.1.18 streaming 重写与 v0.2.0 WS 传输）。相对上游的改动、分流条件与取舍见 [FORK-NOTES.md](FORK-NOTES.md)，更新日志见 [CHANGELOG.md](CHANGELOG.md)。上游代码、MIT 许可证与版权声明原样保留。
 这是一个 CLIProxyAPI（CPA）原生插件，用 CPA 已有的 ChatGPT/Codex OAuth 凭据直接请求。
 
 ## 通过 CPA 插件商店安装（推荐）
@@ -8,7 +8,7 @@
 在管理界面的「第三方插件源 → 插件源 registry URL (plugins.store-sources)」中添加以下地址并保存，然后刷新插件商店，搜索 **CPA OpenAI Basis Points**：
 
 ```text
-https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/v0.2.2-pro.1/registry.json
+ https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/v0.2.2-pro.2/registry.json
 ```
 
 也可合并到 CPA **宿主配置**（`config.yaml`，与下方插件配置共用同一个 `plugins` 节点）：
@@ -17,7 +17,7 @@ https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/v0.2.2-pro
 plugins:
   enabled: true
   store-sources:
-    - https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/v0.2.2-pro.1/registry.json
+     - https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/v0.2.2-pro.2/registry.json
 ```
 
 保留已有插件源，不要整体覆盖原有 `plugins` 配置；内置官方源由 CPA 自动保留。本源使用宿主原生的 `github-release` 安装方式，最新版本以本仓库已发布的 GitHub Release 为准，不在 registry 中另行维护版本号。CPA 会按运行平台下载 `oai-basispoints_<version>_<goos>_<goarch>.zip`，并使用同一 Release 的 `checksums.txt` 校验。本仓库的 `main` 分支就是本 fork 的默认分支，内容与最新 tag 一致（只多文档更新）；想跟随最新代码也可以用 `https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/main/registry.json`，上面的 tag 地址则用于钉住具体版本。
@@ -42,6 +42,8 @@ plugins:
 | 10 | `tool_choice` 诊断细分：声明了但不允许报 `tool_not_allowed_by_tool_choice`，真未声明仍是 `tool_not_in_catalog` | 此前混报 `tool_not_in_catalog` 会误导回灌给模型的纠正提示；两类都仍是 422 协议错误，不触发 5xx/冷却 |
 | 11 | `agent_message` 的 `content` 内联图片与用户消息同样上传，并参与整请求预检 | 多代理协作历史里的图片此前被"assistant 消息跳过"规则漏掉，模型看不到图 |
 | 12 | 回归测试钉：未知历史条目类型（`mcp_call`、`local_shell_call`、`web_search_call`、`computer_call`、`compaction_trigger` 等）原样透传；畸形中转载荷整批拒绝 | 防止后续改动静默删除/改写历史条目（移植上游 v0.2.x 的测试意图） |
+ | 13 | 工具结果图片落位修复：`data:` 内联截图保留原样不上传（加载项原生形态，仍参与预检），`file_id`/HTTPS 引用搬进紧随该结果的 user 消息（原位换标签文本 `[Tool output image N for call_id "X"]`，新消息为 [说明, (标签, 图片) 交替]），张数限额统一计数，`file_id` 引用加形态校验 | 探针实测（2026-09-28 VPS）：工具结果纯文本 200 / 带 `data:` 转附件 422 / 直接 `file_id` 引用 422——上游拒绝 `function_call_output` 里的图片/附件引用，pro.4 的"工具结果内联图片上传"路径（第 7 行的工具结果部分）在上游 100% 失败 |
+ | 14 | 多代理协作历史归一化：`message` 的 `author`/`recipient` 归属元数据序列化成 JSON 作为正文开头说明文本，`agent_message` 降级为带标注的 user 消息，assistant 说明用 `output_text` 部件，畸形正文序列化成可读文本兜底 | 上游对 message 条目拒绝 `author`/`recipient` 字段、不接受 `agent_message` 条目；此前全量透传，多代理协作历史每次请求 400 |
 
 此外还有两处收紧，属于本分支对放行策略的加固：
 

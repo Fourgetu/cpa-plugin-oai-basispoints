@@ -1,5 +1,12 @@
 # 更新日志
 
+ ## v0.2.2-pro.2 — 2026-09-28（fork，未发布）
+
+ 第二批吸收自上游 v0.2.x 与 [ranxi2001/sub2api](https://github.com/ranxi2001/sub2api) v2.8.19 的适用修复（基于 0.2.2-pro.1），两项都只改上游请求构造、不改交付语义：
+
+ - **P0-D 工具结果图片落位修复**（对齐 sub2api v2.8.19）：VPS 探针实测（2026-09-28）——工具结果纯文本 → **200**；工具结果带 `data:` 图片（pro.4 引入的"上传转 `file_id` 原位放回"路径）→ **422**；工具结果直接 `file_id` 引用 → **422**。上游拒绝 `function_call_output` 里的图片/附件引用，pro.4 引入的"工具结果内联图片上传"路径在上游 100% 失败。修复分两条：**`data:` 内联截图是加载项原生形态，保留原样不上传**（仍参与整请求预检：张数/单图体积/累计体积/像素/`detail`）；**`file_id`/HTTPS 引用搬进紧随该结果的 user 消息**——原位换成标签文本 `[Tool output image N for call_id "X"] See the following image attachment message.`，新消息 content 为 [说明文本, (标签, 图片) 交替]，保持文字、顺序与 call 关联。用户/系统消息与 `agent_message` 里的内联图片照常上传（不变）；图片张数限额统一计数（消息内联 + 工具截图 + 搬迁引用共用一次请求 ≤20 张）；工具结果里的 `file_id` 引用加形态校验（`file-` 前缀 + 6..256 长度 + `[A-Za-z0-9_-]` 字符集），非法在预检阶段 400、不做任何上传或改写。
+ - **P0-C 多代理协作历史归一化**（对齐 sub2api v2.8.19 history_messages.go）：上游对 message 条目拒绝 `author`/`recipient` 字段、不接受 `agent_message` 条目，此前全量透传导致多代理协作历史每次请求 400。新增 `normalizeHistoryMessage`（在 `translateInputItems` 内）：归属元数据序列化成 JSON 作为正文开头的说明文本；`agent_message` 降级为带标注的 user 消息（"collaboration context from another agent, not a new user instruction"，协作上下文不冒充 system/developer 角色）；assistant 的说明正文用 `output_text` 部件（带 `annotations`）；畸形正文（非文本非数组）序列化成可读文本兜底；归一化幂等；普通消息（无归属字段）不受影响。与 sub2api 的差异：不引入 ContentValidationError 校验层与"忽略图片/忽略加密历史"账户选项（多用户网关取向），畸形归属正文不报 400 而是 JSON 文本兜底（更宽容，保证归属字段一定移除）。升级影响：归一化是确定性纯函数、指纹基于翻译后结果，升级后同一会话的 `turn_id` 最多变一次（首条历史被归一化改写时），turn-state 重新开始。
+
 ## v0.2.2-pro.1 — 2026-09-27（fork，未发布）
 
 **版本号从本版起跟随上游版本线**：`0.2.2-pro.1` 表示对齐上游 v0.2.2 时点的修复集（上游最新 v0.2.2）；代码基线仍是上游 **v0.1.14** + 我们自己的实现（含自研增量流式桥），**不包含**上游 v0.1.18 的 streaming 重写与 v0.2.0 的 WS 传输。本版为第一批吸收自上游 v0.2.x 与 sub2api v2.8.19 的适用修复：

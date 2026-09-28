@@ -202,8 +202,24 @@ func TestExecutorNativeToolRoundTrip(t *testing.T) {
 						t.Fatal(err)
 					}
 					history := prepared["input"].([]any)
-					if !reflect.DeepEqual(history[len(history)-2], native) || !reflect.DeepEqual(objectValue(history[len(history)-1])["output"], image) {
-						t.Fatalf("next request lost native identity or image result: %#v", history[len(history)-2:])
+					if !reflect.DeepEqual(history[len(history)-3], native) {
+						t.Fatalf("next request lost native identity: %#v", history[len(history)-3:])
+					}
+					// 工具结果里的远端图片引用搬进相邻 user 消息（带标签），原位换成标签文本。
+					toolResult := objectValue(history[len(history)-2])
+					if toolResult["call_id"] != call["call_id"] || stringValue(toolResult["type"]) != "function_call_output" {
+						t.Fatalf("next request lost the tool result identity: %#v", toolResult)
+					}
+					if parts := toolResult["output"].([]any); len(parts) != 1 || stringValue(objectValue(parts[0])["type"]) != "input_text" {
+						t.Fatalf("tool image was not labeled in place: %#v", parts)
+					}
+					follower := objectValue(history[len(history)-1])
+					if follower["type"] != "message" || follower["role"] != "user" {
+						t.Fatalf("relocated image follower missing: %#v", follower)
+					}
+					followerParts := follower["content"].([]any)
+					if len(followerParts) != 3 || objectValue(followerParts[2])["image_url"] != "https://example.test/tool-result.png" {
+						t.Fatalf("relocated image missing: %#v", followerParts)
 					}
 				})
 			}

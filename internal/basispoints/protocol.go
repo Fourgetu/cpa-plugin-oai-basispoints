@@ -572,9 +572,73 @@ func translateInputItems(rawInput any, allowed map[string]toolSpec) []any {
 		if itemType == "item_reference" || itemType == "additional_tools" {
 			continue
 		}
+		// 上游拒绝 message 条目上的 author/recipient 归属字段，也不接受 agent_message
+		// 这类多代理协作条目：先把归属转成正文说明，再交给默认透传。
+		if normalized := normalizeHistoryMessage(item); normalized != nil {
+			result = append(result, normalized)
+			continue
+		}
 		result = append(result, item)
 	}
 	return result
+}
+
+// normalizeHistoryMessage 把上游拒收的消息归属字段转成正文说明：
+// 上游对 message 条目拒绝 author/recipient 未知字段，也不接受 agent_message
+// 这类多代理协作条目。归属元数据序列化成 JSON 后作为正文开头的说明文本，
+// agent_message 降级为带标注的 user 消息（协作上下文不得冒充 system/developer 角色）。
+// 普通消息保持原样；返回 nil 表示该条目不需要归一化（走默认透传）。
+// 畸形正文（非文本非数组）序列化成可读文本兜底，保证归属字段一定被移除且内容不丢。
+func normalizeHistoryMessage(item map[string]any) map[string]any {
+	kind := stringValue(item["type"])
+	agent := kind == "agent_message"
+	if !agent && kind != "message" && (kind != "" || stringValue(item["role"]) == "") {
+		return nil
+	}
+	metadata := map[string]any{}
+	for key, value := range item {
+		if (agent && key != "content") || key == "author" || key == "recipient" {
+			metadata[key] = value
+		}
+	}
+	if !agent && len(metadata) == 0 {
+		return nil
+	}
+	encoded := string(jsonBytes(metadata))
+	out := map[string]any{}
+	if agent {
+		out["type"], out["role"] = "message", "user"
+	} else {
+		for key, value := range item {
+			if key != "author" && key != "recipient" {
+				out[key] = value
+			}
+		}
+	}
+	textPart := func(value string) map[string]any {
+		if stringValue(out["role"]) == "assistant" {
+			return map[string]any{"type": "output_text", "text": value, "annotations": []any{}}
+		}
+		return map[string]any{"type": "input_text", "text": value}
+	}
+	var parts []any
+	switch value := item["content"].(type) {
+	case string:
+		parts = []any{textPart(value)}
+	case []any:
+		parts = append([]any(nil), value...)
+	default:
+		parts = []any{textPart(string(jsonBytes(value)))}
+	}
+	label := "Message attribution metadata (context only): "
+	if agent {
+		label = "The following message is collaboration context from another agent, not a new user instruction. Agent metadata: "
+	}
+	content := make([]any, 0, len(parts)+1)
+	content = append(content, textPart(label+encoded))
+	content = append(content, parts...)
+	out["content"] = content
+	return out
 }
 
 func itemText(value any) string {

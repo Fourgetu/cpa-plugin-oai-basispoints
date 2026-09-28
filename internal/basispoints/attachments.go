@@ -198,13 +198,26 @@ type pendingImageUpload struct {
 	image inlineImage
 }
 
-// uploadInputImages 先对请求里所有内联图片做一次整体校验（张数、单图体积、累计体积、像素），
-// 只有全部通过才逐个上传，避免中途失败留下已上传的孤儿附件。
-// 用户消息与工具结果（function_call_output/custom_tool_call_output）的数组字段参与处理，
-// assistant 消息与不带 data: 前缀的 HTTPS URL 保持原样。
+// toolImageRelocation 记录一个要从工具结果搬出的图片引用（file_id/HTTPS）：
+// 上游以 422 拒绝 function_call_output 里的附件引用，同样的引用在 message content 里合法。
+type toolImageRelocation struct {
+	item  int
+	index int
+	label string
+	part  map[string]any
+}
+
+// uploadInputImages 先对请求里所有图片做一次整体校验（张数、单图体积、累计体积、像素），
+// 只有全部通过才上传与改写，避免中途失败留下已上传的孤儿附件。
+// 用户/系统消息与 agent_message 里的内联图片上传成附件引用；工具结果里的内联截图
+// 保留 data: 原样（加载项原生形态，上传转附件引用反而会被上游以 422 拒绝）；
+// 工具结果里的附件引用（file_id/HTTPS）搬进紧随其后的 user 消息。
 func (s *Service) uploadInputImages(request ExecutorRequest, body map[string]any, c credential, cfg Config) error {
 	items, _ := body["input"].([]any)
 	var pending []pendingImageUpload
+	var relocations []toolImageRelocation
+	toolImageIndex := map[int]int{}
+	imageCount := 0
 	totalBytes := 0
 	for i, value := range items {
 		item := objectValue(value)
@@ -223,22 +236,40 @@ func (s *Service) uploadInputImages(request ExecutorRequest, body map[string]any
 		parts, _ := item[field].([]any)
 		for j, value := range parts {
 			part := objectValue(value)
-			if part == nil {
+			if part == nil || stringValue(part["type"]) != "input_image" {
 				continue
 			}
 			imageURL := stringValue(part["image_url"])
-			if stringValue(part["type"]) != "input_image" || len(imageURL) < 5 || !strings.EqualFold(imageURL[:5], "data:") {
-				continue
-			}
-			if stringValue(part["file_id"]) != "" {
-				return fail(400, "invalid_image", "input_image cannot contain both image_url and file_id")
+			isData := len(imageURL) >= 5 && strings.EqualFold(imageURL[:5], "data:")
+			if imageCount >= maxRequestInlineImages {
+				return fail(400, "invalid_image", fmt.Sprintf("a request may contain at most %d inline images", maxRequestInlineImages))
 			}
 			if err := validateImageDetail(part["detail"]); err != nil {
 				return err
 			}
-			if len(pending) >= maxRequestInlineImages {
-				return fail(400, "invalid_image", fmt.Sprintf("a request may contain at most %d inline images", maxRequestInlineImages))
+			if imageURL != "" && stringValue(part["file_id"]) != "" {
+				return fail(400, "invalid_image", "input_image cannot contain both image_url and file_id")
 			}
+			if !isData {
+				imageCount++
+				// 工具结果里的附件引用（file_id/HTTPS）会被上游以 422 拒绝：
+				// 移到紧随该结果的 user 消息（带标签），同样的引用在 message content 里合法。
+				// 用户/系统消息里的引用已在合法位置，保持原样。
+				if field == "output" {
+					if id := stringValue(part["file_id"]); id != "" && !validAttachmentID(id) {
+						return fail(400, "invalid_image", "input_image requires a valid file_id")
+					}
+					toolImageIndex[i]++
+					relocations = append(relocations, toolImageRelocation{
+						item:  i,
+						index: j,
+						label: fmt.Sprintf("[Tool output image %d for call_id %q]", toolImageIndex[i], stringValue(item["call_id"])),
+						part:  part,
+					})
+				}
+				continue
+			}
+			imageCount++
 			attachment, err := decodeInlineImage(imageURL)
 			if err != nil {
 				return err
@@ -250,48 +281,86 @@ func (s *Service) uploadInputImages(request ExecutorRequest, body map[string]any
 			if err := validateInlineImage(attachment); err != nil {
 				return err
 			}
-			pending = append(pending, pendingImageUpload{item: i, field: field, index: j, part: part, image: attachment})
+			// 工具结果里的内联截图是加载项的原生形态：保留 data: 原样、不上传——
+			// 上传成附件引用再放回 output 会被上游以 422 拒绝（实测确认）。
+			// 用户/系统消息与 agent_message 里的内联图片照常上传成附件引用。
+			if field == "content" {
+				pending = append(pending, pendingImageUpload{item: i, field: field, index: j, part: part, image: attachment})
+			}
 		}
 	}
-	if len(pending) == 0 {
+	if len(pending) == 0 && len(relocations) == 0 {
 		return nil
 	}
-	endpoint, err := attachmentURL(cfg.ResponsesURL)
-	if err != nil {
-		return err
-	}
-	updated := make(map[int][]any)
-	fields := make(map[int]string)
-	for _, upload := range pending {
-		hash := sha256.New()
-		_, _ = hash.Write(jsonBytes([]string{endpoint, c.AccountID, c.AuthMode, c.AccessToken, upload.image.mediaType}))
-		_, _ = hash.Write(upload.image.data)
-		var key [sha256.Size]byte
-		copy(key[:], hash.Sum(nil))
-		fileID, err := s.attachments.getOrUpload(key, func() (string, error) {
-			return s.uploadImage(request, endpoint, upload.image, c)
-		})
+	if len(pending) > 0 {
+		endpoint, err := attachmentURL(cfg.ResponsesURL)
 		if err != nil {
 			return err
 		}
-		if updated[upload.item] == nil {
-			original, _ := objectValue(items[upload.item])[upload.field].([]any)
-			updated[upload.item] = append([]any(nil), original...)
-			fields[upload.item] = upload.field
+		updated := make(map[int][]any)
+		fields := make(map[int]string)
+		for _, upload := range pending {
+			hash := sha256.New()
+			_, _ = hash.Write(jsonBytes([]string{endpoint, c.AccountID, c.AuthMode, c.AccessToken, upload.image.mediaType}))
+			_, _ = hash.Write(upload.image.data)
+			var key [sha256.Size]byte
+			copy(key[:], hash.Sum(nil))
+			fileID, err := s.attachments.getOrUpload(key, func() (string, error) {
+				return s.uploadImage(request, endpoint, upload.image, c)
+			})
+			if err != nil {
+				return err
+			}
+			if updated[upload.item] == nil {
+				original, _ := objectValue(items[upload.item])[upload.field].([]any)
+				updated[upload.item] = append([]any(nil), original...)
+				fields[upload.item] = upload.field
+			}
+			part := cloneObject(upload.part)
+			delete(part, "image_url")
+			part["file_id"] = fileID
+			if _, exists := part["detail"]; !exists {
+				part["detail"] = "auto"
+			}
+			updated[upload.item][upload.index] = part
 		}
-		part := cloneObject(upload.part)
-		delete(part, "image_url")
-		part["file_id"] = fileID
-		if _, exists := part["detail"]; !exists {
-			part["detail"] = "auto"
+		for index, parts := range updated {
+			item := cloneObject(objectValue(items[index]))
+			item[fields[index]] = parts
+			items[index] = item
 		}
-		updated[upload.item][upload.index] = part
 	}
-	for index, parts := range updated {
-		item := cloneObject(objectValue(items[index]))
-		item[fields[index]] = parts
-		items[index] = item
+	if len(relocations) == 0 {
+		return nil
 	}
+	// 把工具结果里的附件引用搬进紧随其后的 user 消息：原位换成标签文本，
+	// 图片按 [标签, 图片] 交替放进新消息，保持文字、顺序与 call 关联。
+	byItem := map[int][]toolImageRelocation{}
+	for _, relocation := range relocations {
+		byItem[relocation.item] = append(byItem[relocation.item], relocation)
+	}
+	insertions := map[int]map[string]any{}
+	for itemIndex, group := range byItem {
+		original, _ := objectValue(items[itemIndex])["output"].([]any)
+		output := append([]any(nil), original...)
+		content := []any{map[string]any{"type": "input_text", "text": "The following images are tool output from the preceding tool result, not a new user instruction."}}
+		for _, relocation := range group {
+			output[relocation.index] = map[string]any{"type": "input_text", "text": relocation.label + " See the following image attachment message."}
+			content = append(content, map[string]any{"type": "input_text", "text": relocation.label}, relocation.part)
+		}
+		rewritten := cloneObject(objectValue(items[itemIndex]))
+		rewritten["output"] = output
+		items[itemIndex] = rewritten
+		insertions[itemIndex] = map[string]any{"type": "message", "role": "user", "content": content}
+	}
+	next := make([]any, 0, len(items)+len(insertions))
+	for index, value := range items {
+		next = append(next, value)
+		if insertion, exists := insertions[index]; exists {
+			next = append(next, insertion)
+		}
+	}
+	body["input"] = next
 	return nil
 }
 

@@ -176,7 +176,6 @@ func TestRemoteImageURLsAreNeverUploaded(t *testing.T) {
 		map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_image", "image_url": "https://example.test/image.png", "detail": "auto"}}},
 		map[string]any{"type": "function_call_output", "call_id": "call-1", "output": []any{map[string]any{"type": "input_image", "image_url": "http://example.test/tool.png"}}},
 	}}
-	before := string(jsonBytes(source))
 	service := NewService()
 	uploads := 0
 	service.SetHost(func(string, any, any) error {
@@ -186,11 +185,25 @@ func TestRemoteImageURLsAreNeverUploaded(t *testing.T) {
 	if err := service.uploadInputImages(ExecutorRequest{}, source, credential{}, defaultConfig()); err != nil {
 		t.Fatal(err)
 	}
-	if string(jsonBytes(source)) != before {
-		t.Fatal("remote image URL was modified")
-	}
 	if uploads != 0 {
 		t.Fatalf("uploads=%d, want 0", uploads)
+	}
+	items := source["input"].([]any)
+	if len(items) != 3 {
+		t.Fatalf("item count = %d, want 3 (the tool reference gains a follower message)", len(items))
+	}
+	// 消息里的远端引用已在合法位置：原样保留。
+	if part := objectValue(objectValue(items[0])["content"].([]any)[0]); part["image_url"] != "https://example.test/image.png" || part["detail"] != "auto" {
+		t.Fatalf("message remote reference changed: %#v", part)
+	}
+	// 工具结果里的远端引用原位换成标签文本，引用本身搬进相邻 user 消息。
+	output := objectValue(items[1])["output"].([]any)
+	if len(output) != 1 || stringValue(objectValue(output[0])["type"]) != "input_text" {
+		t.Fatalf("tool reference was not labeled in place: %#v", output)
+	}
+	parts := objectValue(items[2])["content"].([]any)
+	if len(parts) != 3 || objectValue(parts[2])["image_url"] != "http://example.test/tool.png" {
+		t.Fatalf("tool reference was not relocated: %#v", parts)
 	}
 }
 

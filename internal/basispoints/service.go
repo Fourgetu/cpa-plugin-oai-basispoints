@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -16,12 +17,13 @@ type Service struct {
 	mu          sync.RWMutex
 	cfg         Config
 	host        HostCall
+	sleep       func(time.Duration)
 	stopped     bool
 }
 
 func NewService() *Service {
 	cfg := defaultConfig()
-	return &Service{cfg: cfg}
+	return &Service{cfg: cfg, sleep: time.Sleep}
 }
 
 func (s *Service) SetHost(host HostCall) {
@@ -38,6 +40,21 @@ func (s *Service) call(method string, payload any, out any) error {
 		return errors.New("host callback is not initialized")
 	}
 	return host(method, payload, out)
+}
+
+// wait 用于限速/上游 5xx 的退避等待；测试注入空 sleep 以免真的等待。
+func (s *Service) wait(delay time.Duration) {
+	if delay <= 0 {
+		return
+	}
+	s.mu.RLock()
+	sleep := s.sleep
+	s.mu.RUnlock()
+	if sleep == nil {
+		time.Sleep(delay)
+		return
+	}
+	sleep(delay)
 }
 
 func (s *Service) configure(raw json.RawMessage) error {
@@ -144,12 +161,18 @@ func (s *Service) execute(raw json.RawMessage, stream bool) (any, error) {
 	}
 	payload, response, headers, err := s.executeResponse(request, body, credential, false)
 	if err != nil {
-		// 原生 Responses 客户端的本地协议问题按内联失败交付：HTTP 200 + status=failed。
-		// 交给 CPA 当 5xx 会把账号冷却，后续请求一起 503。
+		// 原生 Responses 客户端的本地协议问题与上游 5xx 都按内联失败交付：HTTP 200 + status=failed。
+		// 交给 CPA 当 5xx 会把（单凭据插件的唯一）账号冷却，整个模型变成 503 墙。
 		if request.Format == openAIResponseFormat {
 			if protocolErr, ok := asProtocolError(err); ok {
 				return map[string]any{
 					"Payload": failureResponseBody("", protocolFailureCode(err), protocolErr.Message),
+					"Headers": http.Header{"Content-Type": {"application/json"}},
+				}, nil
+			}
+			if upstreamErr, ok := asUpstreamServerError(err); ok {
+				return map[string]any{
+					"Payload": failureResponseBody("", "upstream_server_error", upstreamErr.Message),
 					"Headers": http.Header{"Content-Type": {"application/json"}},
 				}, nil
 			}
@@ -284,6 +307,7 @@ func registration(cfg Config) map[string]any {
 				{"Name": "auth_mode", "Type": "string", "Description": "Basis Points authentication mode; normally chatgpt."},
 				{"Name": "tools_version_id", "Type": "string", "Description": "Optional authoritative Basis Points tools catalog version."},
 				{"Name": "max_request_inline_images", "Type": "integer", "Description": "单个请求允许的内联图片张数上限（默认 512，范围 1–4096）。体积/像素闸门固定，不受此项影响。"},
+				{"Name": "max_attachment_cache_entries", "Type": "integer", "Description": "附件（上传图片）缓存条数上限，默认 2048，范围 1–65536；条目有效期 15 分钟。"},
 			},
 		},
 		"capabilities": map[string]any{
@@ -337,6 +361,15 @@ func (s *Service) executeStreamIncremental(request ExecutorRequest, body map[str
 	}
 	upstream, err := s.upstreamStream(request, body, credential)
 	if err != nil {
+		// 上游 5xx：以流内 response.failed 交付（HTTP 200 SSE）并干净收尾。交给 CPA 会把
+		// 唯一的凭据冷却成 503 墙（同一账号的其它客户端一起断），客户端看到失败终态可立即重试。
+		if upstreamErr, ok := asUpstreamServerError(err); ok {
+			payload := map[string]any{"stream_id": request.StreamID, "payload": syntheticFailureStream(nil, "", "upstream_server_error", upstreamErr.Message)}
+			if emitErr := s.call("host.stream.emit", payload, nil); emitErr == nil {
+				_ = s.call("host.stream.close", map[string]any{"stream_id": request.StreamID}, nil)
+				return map[string]any{"Headers": map[string][]string{"Content-Type": {"text/event-stream"}, "Cache-Control": {"no-cache"}}}, nil
+			}
+		}
 		return nil, err
 	}
 	go func() {

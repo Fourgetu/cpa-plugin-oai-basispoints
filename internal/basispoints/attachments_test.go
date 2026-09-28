@@ -18,6 +18,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func testImageDataURL(t *testing.T) (string, []byte) {
@@ -186,6 +187,7 @@ func TestAttachmentFailureStopsResponseSubmission(t *testing.T) {
 		for _, method := range []string{"executor.execute", "executor.execute_stream"} {
 			t.Run(tc.name+"/"+method, func(t *testing.T) {
 				service := NewService()
+				service.sleep = func(time.Duration) {}
 				calls := 0
 				service.SetHost(func(method string, payload any, out any) error {
 					calls++
@@ -200,8 +202,13 @@ func TestAttachmentFailureStopsResponseSubmission(t *testing.T) {
 				request.StreamID = "test-downstream"
 				_, err := service.Handle(method, jsonBytes(request))
 				var apiErr *APIError
-				if !errors.As(err, &apiErr) || apiErr.Status != tc.want || calls != 1 {
-					t.Fatalf("error=%v calls=%d", err, calls)
+				// 429/503 自 0.2.2-pro.4 起会退避重试（首次 + 重试上限次），最终仍以原状态码失败。
+				wantCalls := 1
+				if _, retry := rateLimitRetryDelay(tc.status, nil, 0); retry {
+					wantCalls = rateLimitRetryLimit + 1
+				}
+				if !errors.As(err, &apiErr) || apiErr.Status != tc.want || calls != wantCalls {
+					t.Fatalf("error=%v calls=%d want=%d", err, calls, wantCalls)
 				}
 			})
 		}
@@ -230,12 +237,13 @@ func TestAttachmentCacheCredentialAndEndpointIsolation(t *testing.T) {
 		*out.(*upstreamResponse) = upstreamResponse{StatusCode: 200, Body: jsonBytes(map[string]any{"openai_file_id": fmt.Sprintf("file-%d", uploads)})}
 		return nil
 	})
+	// 令牌不再参与缓存键（令牌刷新不该让整份缓存失效），账号与端点仍然隔离。
 	for _, tc := range []struct{ account, token, endpoint, want string }{
 		{"account-a", "token-a", DefaultResponsesURL, "file-1"},
 		{"account-a", "token-a", DefaultResponsesURL, "file-1"},
+		{"account-a", "token-b", DefaultResponsesURL, "file-1"},
 		{"account-b", "token-a", DefaultResponsesURL, "file-2"},
-		{"account-a", "token-b", DefaultResponsesURL, "file-3"},
-		{"account-a", "token-a", "https://custom.test/api/responses", "file-4"},
+		{"account-a", "token-a", "https://custom.test/api/responses", "file-3"},
 	} {
 		service.cfg.ResponsesURL = tc.endpoint
 		request := imageRequest(map[string]any{"type": "input_image", "image_url": dataURL})
@@ -288,17 +296,18 @@ func TestAttachmentCacheCoalescesConcurrentUploads(t *testing.T) {
 func TestAttachmentCacheEvictsOldestAndDoesNotCacheFailures(t *testing.T) {
 	var cache attachmentCache
 	key := sha256.Sum256([]byte("first"))
-	if _, err := cache.getOrUpload(key, func() (string, error) { return "", errors.New("failed") }); err == nil {
+	if _, err := cache.getOrUpload(key, 0, func() (string, error) { return "", errors.New("failed") }); err == nil {
 		t.Fatal("upload failure hidden")
 	}
-	if fileID, err := cache.getOrUpload(key, func() (string, error) { return "file-first", nil }); err != nil || fileID != "file-first" {
+	if fileID, err := cache.getOrUpload(key, 0, func() (string, error) { return "file-first", nil }); err != nil || fileID != "file-first" {
 		t.Fatal("failed upload poisoned the next explicit request")
 	}
-	for i := range maxAttachmentCacheEntries {
+	limit := 8
+	for i := range limit + 1 {
 		next := sha256.Sum256([]byte(fmt.Sprint(i)))
-		_, _ = cache.getOrUpload(next, func() (string, error) { return "file-next", nil })
+		_, _ = cache.getOrUpload(next, limit, func() (string, error) { return "file-next", nil })
 	}
-	if len(cache.entries) != maxAttachmentCacheEntries || cache.entries[key] != nil || len(cache.pending) != 0 {
+	if len(cache.entries) != limit || cache.entries[key] != nil || len(cache.pending) != 0 {
 		t.Fatal("upload cache is unbounded or did not evict the oldest entry")
 	}
 }

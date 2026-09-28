@@ -42,7 +42,9 @@ plugins:
       # 旧默认值 20 会把含大量历史工具截图的长会话锁死（每轮重发全量历史），故放宽并做成可调。
       # 单图解码后 ≤20 MiB、整请求累计 ≤32 MiB、解码后 ≤64 MP 三道闸门固定，不受此项影响。
       max_request_inline_images: 512
-
+      # 附件（上传图片）缓存条数上限，默认 2048；允许范围：1～65536。
+      # 缓存只存"图片摘要 → file_id"，条目有效期 15 分钟；上游附件失效后不再复用旧 file_id。
+      max_attachment_cache_entries: 2048
 
       # 认证模式，通常保持 chatgpt；凭据来自 CPA 已有的 Codex OAuth 文件。
       # 不要在这里填写 access_token、refresh_token 或其他密钥。

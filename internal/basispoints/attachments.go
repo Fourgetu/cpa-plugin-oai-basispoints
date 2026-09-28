@@ -18,10 +18,18 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 )
 
 // 只缓存摘要和文件 ID，不保存图片或凭据；容量不限制单次请求的图片数量。
-const maxAttachmentCacheEntries = 512
+// 上限由配置 max_attachment_cache_entries 决定（默认 2048，范围 1–65536）；
+// 条目有效期 attachmentCacheTTL：上游附件会失效，复用过期 file_id 会被上游以
+// 500 "Unknown error while validating file ownership" 拒绝（2026-09-28 实测）。
+const (
+	defaultAttachmentCacheEntries  = 2048
+	maxAttachmentCacheEntriesLimit = 65536
+	attachmentCacheTTL             = 15 * time.Minute
+)
 
 // 上传前的整体预检上限：全部校验通过后才开始上传，避免失败时留下孤儿附件。
 // 张数上限是准入护栏，不是上游硬限制（上游没有声明过该限制，官方插件也没有）：
@@ -36,8 +44,9 @@ const (
 )
 
 type cachedAttachment struct {
-	key    [sha256.Size]byte
-	fileID string
+	key      [sha256.Size]byte
+	fileID   string
+	cachedAt time.Time
 }
 
 type pendingAttachment struct {
@@ -53,13 +62,19 @@ type attachmentCache struct {
 	pending map[[sha256.Size]byte]*pendingAttachment
 }
 
-func (c *attachmentCache) getOrUpload(key [sha256.Size]byte, upload func() (string, error)) (string, error) {
+func (c *attachmentCache) getOrUpload(key [sha256.Size]byte, limit int, upload func() (string, error)) (string, error) {
 	c.mu.Lock()
 	if entry := c.entries[key]; entry != nil {
-		c.order.MoveToFront(entry)
-		fileID := entry.Value.(cachedAttachment).fileID
-		c.mu.Unlock()
-		return fileID, nil
+		cached := entry.Value.(cachedAttachment)
+		// 上游附件会失效：复用过期 file_id 会被上游以 500 "validating file ownership" 拒绝，
+		// 所以超期条目视为未命中并丢弃，由本轮重新上传。
+		if time.Since(cached.cachedAt) < attachmentCacheTTL {
+			c.order.MoveToFront(entry)
+			c.mu.Unlock()
+			return cached.fileID, nil
+		}
+		delete(c.entries, key)
+		c.order.Remove(entry)
 	}
 	if pending := c.pending[key]; pending != nil {
 		c.mu.Unlock()
@@ -81,8 +96,8 @@ func (c *attachmentCache) getOrUpload(key [sha256.Size]byte, upload func() (stri
 		if c.entries == nil {
 			c.entries = make(map[[sha256.Size]byte]*list.Element)
 		}
-		c.entries[key] = c.order.PushFront(cachedAttachment{key: key, fileID: fileID})
-		if c.order.Len() > maxAttachmentCacheEntries {
+		c.entries[key] = c.order.PushFront(cachedAttachment{key: key, fileID: fileID, cachedAt: time.Now()})
+		if limit > 0 && c.order.Len() > limit {
 			oldest := c.order.Back()
 			delete(c.entries, oldest.Value.(cachedAttachment).key)
 			c.order.Remove(oldest)
@@ -91,6 +106,15 @@ func (c *attachmentCache) getOrUpload(key [sha256.Size]byte, upload func() (stri
 	pending.fileID, pending.err = fileID, err
 	close(pending.done)
 	return fileID, err
+}
+
+// reset 丢弃全部缓存条目。上游明确报"附件归属校验失败"时调用：那些 file_id 已经不可用，
+// 继续复用只会让之后每一次请求都撞同一个 500，所以下一轮一律重新上传。
+func (c *attachmentCache) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = nil
+	c.order.Init()
 }
 
 type inlineImage struct {
@@ -309,11 +333,13 @@ func (s *Service) uploadInputImages(request ExecutorRequest, body map[string]any
 		fields := make(map[int]string)
 		for _, upload := range pending {
 			hash := sha256.New()
-			_, _ = hash.Write(jsonBytes([]string{endpoint, c.AccountID, c.AuthMode, c.AccessToken, upload.image.mediaType}))
+			// 缓存键只绑"端点 + 账号 + 介质类型 + 图片字节"：不能绑 access_token——
+			// 令牌一刷新整份缓存就失效，历史图片会在之后每一轮请求里重新上传。
+			_, _ = hash.Write(jsonBytes([]string{endpoint, c.AccountID, c.AuthMode, upload.image.mediaType}))
 			_, _ = hash.Write(upload.image.data)
 			var key [sha256.Size]byte
 			copy(key[:], hash.Sum(nil))
-			fileID, err := s.attachments.getOrUpload(key, func() (string, error) {
+			fileID, err := s.attachments.getOrUpload(key, cfg.MaxAttachmentCacheEntries, func() (string, error) {
 				return s.uploadImage(request, endpoint, upload.image, c)
 			})
 			if err != nil {
@@ -394,30 +420,38 @@ func (s *Service) uploadImage(request ExecutorRequest, endpoint string, attachme
 	}
 	headers := authHeaders(c, false)
 	headers.Set("Content-Type", writer.FormDataContentType())
-	var response upstreamResponse
-	if err := s.call("host.http.do", map[string]any{
-		"host_callback_id": request.HostCallbackID,
-		"method":           http.MethodPost,
-		"url":              endpoint,
-		"headers":          headers,
-		"body":             body.Bytes(),
-	}, &response); err != nil {
-		return "", fail(502, "attachment_transport", "Basis Points attachment upload transport failed: "+attachmentErrorMessage([]byte(err.Error()), c, attachment))
+	for attempt := 0; ; attempt++ {
+		var response upstreamResponse
+		if err := s.call("host.http.do", map[string]any{
+			"host_callback_id": request.HostCallbackID,
+			"method":           http.MethodPost,
+			"url":              endpoint,
+			"headers":          headers,
+			"body":             body.Bytes(),
+		}, &response); err != nil {
+			return "", fail(502, "attachment_transport", "Basis Points attachment upload transport failed: "+attachmentErrorMessage([]byte(err.Error()), c, attachment))
+		}
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			// 429/503 是上传接口限速（同一账号的其它客户端也消耗这份配额），退避后重试；
+			// 直接抛给客户端会诱发"整轮重试 → 重传所有历史图片"，把配额烧得更干。
+			if delay, retry := rateLimitRetryDelay(response.StatusCode, response.Headers, attempt); retry {
+				s.wait(delay)
+				continue
+			}
+			return "", fail(response.StatusCode, "attachment_upload_error", fmt.Sprintf("Basis Points attachment upload HTTP %d: %s", response.StatusCode, attachmentErrorMessage(response.Body, c, attachment)))
+		}
+		var result struct {
+			FileID string `json:"openai_file_id"`
+		}
+		if json.Unmarshal(response.Body, &result) != nil {
+			return "", fail(502, "invalid_attachment_response", "Basis Points attachment upload returned no openai_file_id")
+		}
+		fileID := strings.TrimSpace(result.FileID)
+		if !validAttachmentID(fileID) {
+			return "", fail(502, "invalid_attachment_response", "Basis Points attachment upload returned an invalid openai_file_id")
+		}
+		return fileID, nil
 	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return "", fail(response.StatusCode, "attachment_upload_error", fmt.Sprintf("Basis Points attachment upload HTTP %d: %s", response.StatusCode, attachmentErrorMessage(response.Body, c, attachment)))
-	}
-	var result struct {
-		FileID string `json:"openai_file_id"`
-	}
-	if json.Unmarshal(response.Body, &result) != nil {
-		return "", fail(502, "invalid_attachment_response", "Basis Points attachment upload returned no openai_file_id")
-	}
-	fileID := strings.TrimSpace(result.FileID)
-	if !validAttachmentID(fileID) {
-		return "", fail(502, "invalid_attachment_response", "Basis Points attachment upload returned an invalid openai_file_id")
-	}
-	return fileID, nil
 }
 
 func attachmentErrorMessage(raw []byte, c credential, attachment inlineImage) string {

@@ -1,7 +1,7 @@
-# Fourgetu fork 说明（分支 `prod/v0.2.2`，版本 `0.2.2-pro.3`）
+# Fourgetu fork 说明（分支 `prod/v0.2.2`，版本 `0.2.2-pro.4`）
 
 本仓库是 [JaxsonWang/cpa-plugin-oai-basispoints](https://github.com/JaxsonWang/cpa-plugin-oai-basispoints) 的 fork，发布在 [Fourgetu/cpa-plugin-oai-basispoints](https://github.com/Fourgetu/cpa-plugin-oai-basispoints)。
- 分支 `prod/v0.2.2` 以上游 **v0.1.14**（commit `1b9359a`）为**代码基线**。**从 0.2.2-pro.1 起 `Version` 跟随上游版本线**：上游最新 v0.2.2 → 本版 `0.2.2-pro.3`，tag 仍 = `v` + `Version`（即 `v0.2.2-pro.3`）；版本号只表示兼容性对齐点（吸收到上游 v0.2.2 时点适用的修复），代码仍是 v0.1.14 基线 + 自研增量流式桥——**未采纳**上游 v0.1.18 的 streaming 重写与 v0.2.0 的 WS 传输（上游自家生产部署里 WS 握手持续 404、其验证文档也不主张性能收益，故观望）。在上游之上保留五处生产验证过的改动、一组有界的工具封装纠错（对齐 sub2api v2.8.15）、一组能力/校验边界（对齐上游 v0.1.15–v0.1.18 与 sub2api v2.8.16，见第 8 节）、命令原文直传与附件预检一组（对齐 sub2api 的 BPS 协议实践，见第 9、10 节）、第一批上游 v0.2.x / sub2api v2.8.19 修复（见第 11 节）、第二批 sub2api v2.8.19 修复——工具结果图片落位与多代理协作历史归一化（见第 12 节），以及图片张数上限可配置（见第 13 节）。
+ 分支 `prod/v0.2.2` 以上游 **v0.1.14**（commit `1b9359a`）为**代码基线**。**从 0.2.2-pro.1 起 `Version` 跟随上游版本线**：上游最新 v0.2.2 → 本版 `0.2.2-pro.4`，tag 仍 = `v` + `Version`（即 `v0.2.2-pro.4`）；版本号只表示兼容性对齐点（吸收到上游 v0.2.2 时点适用的修复），代码仍是 v0.1.14 基线 + 自研增量流式桥——**未采纳**上游 v0.1.18 的 streaming 重写与 v0.2.0 的 WS 传输（上游自家生产部署里 WS 握手持续 404、其验证文档也不主张性能收益，故观望）。在上游之上保留五处生产验证过的改动、一组有界的工具封装纠错（对齐 sub2api v2.8.15）、一组能力/校验边界（对齐上游 v0.1.15–v0.1.18 与 sub2api v2.8.16，见第 8 节）、命令原文直传与附件预检一组（对齐 sub2api 的 BPS 协议实践，见第 9、10 节）、第一批上游 v0.2.x / sub2api v2.8.19 修复（见第 11 节）、第二批 sub2api v2.8.19 修复（见第 12 节）、图片张数上限可配置（见第 13 节），以及限速/上游 5xx 鲁棒性（见第 14 节）。
 
 除本文列出的差异外，其余行为与 v0.1.14 一致；上游代码、MIT 许可证与版权声明原样保留。
 
@@ -187,6 +187,25 @@ docker run --rm -v "$PWD":/src -w /src golang:1.26 sh -c '
  ### 已知不做
 
  - **WS 传输与源认证菜单**：继续观望。上游自家生产部署里 WS 握手持续 404，其验证文档也不主张性能收益；现有 SSE 增量桥 + 15s 保活够用。
+
+## 14. 限速与上游 5xx 的鲁棒性（0.2.2-pro.4）
+
+三个线上事故（2026-09-28，全部有 `/root/cpa/logs/main.log` 与 `error-v1-responses-*.log` 留证）：
+
+1. **附件上传 429**（13:56:43、14:26:46）`attachment upload HTTP 429: 429: File upload was rate limited by OpenAI.`
+2. **账号级 429**（14:00:10 / 14:03:59 / 14:06:05 / 14:17:03 / 14:18:40）`Basis Points HTTP 429: You've exceeded the 1000 request(s) every 1 minute(s) rate limit`。**这一条不是我们打满的**：gin 日志显示客户端只有 1–3 请求/分钟（唯一来源 IP 47.180.0.241），每个失败请求只有 1–2 次上游调用（dump 里 `API REQUEST` 段）、客户端 `X-Stainless-Retry-Count: 0`，全天 496 次 200 对 7 次 429。该配额是**账号级**且与同一账号的其它客户端（用户确认有"网页端"）共用——能打满它的只有账号侧的另一个消费者。
+3. **上游 500 → CPA 冷却 → 503 墙**（14:36:36–14:36:54）：请求 12 张图（其中 10 张是工具结果截图，按 pro.2 规则原样内联；2 张命中附件缓存被换成 `file_id`），上游回 `Basis Points HTTP 500: Unknown error while validating file ownership`。插件把 500 交给 CPA → CPA 判定凭据故障 → 连续 9 次 503 `auth_unavailable: no auth available`。
+
+**本版对策**：
+
+- `rateLimitRetryDelay`（`upstream.go`）：429/503/500/502/504 退避重试，最多 2 次、基数 1s 指数递增（上限 8s）；`Retry-After` 可解析且在 8s 内就按它等，否则放弃重试（不把请求挂过 Cloudflare 的 ~100s）。上游请求、流式请求与附件上传三处都接。
+- `asUpstreamServerError`（`types.go`）+ `service.go` 两处交付点：上游 5xx（`upstream_error` / `attachment_upload_error` 且状态 ≥500）按**内联失败**交付——流式路径 `syntheticFailureStream` → `response.failed`，非流式原生 Responses 路径 `failureResponseBody` → `status=failed`，都是 HTTP 200。**单凭据插件里冷却唯一凭据等于整模型宕机**，所以这里刻意不让 CPA 看到 5xx（与第 3 节的协议错误内联交付同一原则）。
+- `isStaleAttachmentOwnership`（`upstream.go`）+ `attachmentCache.reset()`（`attachments.go`）：认出"附件归属校验失败"后清空缓存并立即返回（重试同一请求体不可能成功）。
+- 附件缓存三项改造：键去掉 `access_token`（`jsonBytes([]string{endpoint, c.AccountID, c.AuthMode, upload.image.mediaType})`）；条目带 `cachedAt` 与 `attachmentCacheTTL = 15 * time.Minute`（超期视为未命中）；容量由配置 `max_attachment_cache_entries` 决定（默认 2048，范围 1–65536，之前硬编码 512）。
+- 测试注入 `Service.sleep` 以便免等待地断言重试次数。
+
+**刻意没做**：不在同一请求内"丢弃失效 file_id 后重跑一遍"（需要回放请求体，改动面大）；清缓存 + 客户端重试下一轮即可自愈。
+
 
 ## 13. 图片张数上限可配置（0.2.2-pro.3）
 

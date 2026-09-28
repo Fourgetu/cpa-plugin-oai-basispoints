@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	Version        = "0.2.2-pro.3"
+	Version        = "0.2.2-pro.4"
 	Provider       = "oai-basispoints"
 	AuthProviderID = "codex"
 	PluginID       = Provider
@@ -43,6 +43,20 @@ func asProtocolError(err error) (*APIError, bool) {
 	switch apiError.Kind {
 	case "invalid_tool_call", "basispoints_protocol_error", "basispoints_invalid_response",
 		"basispoints_stream_incomplete", "basispoints_stream_error":
+		return apiError, true
+	}
+	return nil, false
+}
+
+// asUpstreamServerError 判断错误是不是上游 5xx。单凭据插件里把 5xx 交给 CPA 会把账号冷却、
+// 整个模型变成 503 墙（同一账号的其它客户端一起断），所以这类错误在服务层按内联失败交付。
+func asUpstreamServerError(err error) (*APIError, bool) {
+	var apiError *APIError
+	if !errors.As(err, &apiError) || apiError == nil || apiError.Status < 500 || apiError.Status > 599 {
+		return nil, false
+	}
+	switch apiError.Kind {
+	case "upstream_error", "attachment_upload_error":
 		return apiError, true
 	}
 	return nil, false
@@ -147,28 +161,30 @@ type streamChunk struct {
 }
 
 type Config struct {
-	DataDir                string            `yaml:"data_dir" json:"data_dir"`
-	ResponsesURL           string            `yaml:"responses_url" json:"responses_url"`
-	UpstreamModel          string            `yaml:"upstream_model" json:"upstream_model"`
-	Models                 []string          `yaml:"models" json:"models"`
-	ModelMappings          map[string]string `yaml:"model_mappings" json:"model_mappings"`
-	TimeoutSeconds         int               `yaml:"timeout_seconds" json:"timeout_seconds"`
-	MaxResponseBytes       int               `yaml:"max_response_bytes" json:"max_response_bytes"`
-	AuthMode               string            `yaml:"auth_mode" json:"auth_mode"`
-	MaxRequestInlineImages int               `yaml:"max_request_inline_images" json:"max_request_inline_images"`
-	ToolsVersionID         string            `yaml:"tools_version_id" json:"tools_version_id"`
+	DataDir                   string            `yaml:"data_dir" json:"data_dir"`
+	ResponsesURL              string            `yaml:"responses_url" json:"responses_url"`
+	UpstreamModel             string            `yaml:"upstream_model" json:"upstream_model"`
+	Models                    []string          `yaml:"models" json:"models"`
+	ModelMappings             map[string]string `yaml:"model_mappings" json:"model_mappings"`
+	TimeoutSeconds            int               `yaml:"timeout_seconds" json:"timeout_seconds"`
+	MaxResponseBytes          int               `yaml:"max_response_bytes" json:"max_response_bytes"`
+	AuthMode                  string            `yaml:"auth_mode" json:"auth_mode"`
+	MaxRequestInlineImages    int               `yaml:"max_request_inline_images" json:"max_request_inline_images"`
+	MaxAttachmentCacheEntries int               `yaml:"max_attachment_cache_entries" json:"max_attachment_cache_entries"`
+	ToolsVersionID            string            `yaml:"tools_version_id" json:"tools_version_id"`
 }
 
 func defaultConfig() Config {
 	return Config{
-		DataDir:                "plugins/oai-basispoints-data",
-		ResponsesURL:           DefaultResponsesURL,
-		UpstreamModel:          DefaultUpstreamModel,
-		Models:                 []string{DefaultModelID},
-		TimeoutSeconds:         300,
-		MaxResponseBytes:       64 << 20,
-		MaxRequestInlineImages: defaultMaxRequestInlineImages,
-		AuthMode:               "chatgpt",
+		DataDir:                   "plugins/oai-basispoints-data",
+		ResponsesURL:              DefaultResponsesURL,
+		UpstreamModel:             DefaultUpstreamModel,
+		Models:                    []string{DefaultModelID},
+		TimeoutSeconds:            300,
+		MaxResponseBytes:          64 << 20,
+		MaxRequestInlineImages:    defaultMaxRequestInlineImages,
+		MaxAttachmentCacheEntries: defaultAttachmentCacheEntries,
+		AuthMode:                  "chatgpt",
 	}
 }
 
@@ -203,6 +219,12 @@ func (c *Config) normalize() error {
 	}
 	if c.MaxRequestInlineImages < 1 || c.MaxRequestInlineImages > maxRequestInlineImagesLimit {
 		return fail(400, "invalid_config", fmt.Sprintf("max_request_inline_images must be between 1 and %d", maxRequestInlineImagesLimit))
+	}
+	if c.MaxAttachmentCacheEntries == 0 {
+		c.MaxAttachmentCacheEntries = defaultAttachmentCacheEntries
+	}
+	if c.MaxAttachmentCacheEntries < 1 || c.MaxAttachmentCacheEntries > maxAttachmentCacheEntriesLimit {
+		return fail(400, "invalid_config", fmt.Sprintf("max_attachment_cache_entries must be between 1 and %d", maxAttachmentCacheEntriesLimit))
 	}
 	seen := map[string]bool{}
 	models := make([]string, 0, len(c.Models))

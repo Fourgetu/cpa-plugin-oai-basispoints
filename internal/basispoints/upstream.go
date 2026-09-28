@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -85,7 +86,19 @@ func authHeaders(c credential, stream bool) http.Header {
 }
 
 func (s *Service) upstreamRequest(request ExecutorRequest, body map[string]any, c credential, stream bool) (upstreamResponse, error) {
-	return s.upstreamRequestAttempt(request, body, c, stream, true)
+	for attempt := 0; ; attempt++ {
+		response, err := s.upstreamRequestAttempt(request, body, c, stream, true)
+		if isStaleAttachmentOwnership(err) {
+			// 缓存的 file_id 已失效：清掉缓存让下一轮重新上传；同一个请求体重试必然再失败。
+			s.attachments.reset()
+			return response, err
+		}
+		delay, retry := rateLimitRetryDelay(response.StatusCode, response.Headers, attempt)
+		if !retry {
+			return response, err
+		}
+		s.wait(delay)
+	}
 }
 
 func (s *Service) upstreamRequestAttempt(request ExecutorRequest, body map[string]any, c credential, stream bool, allowEncryptedRetry bool) (upstreamResponse, error) {
@@ -117,7 +130,19 @@ func (s *Service) upstreamRequestAttempt(request ExecutorRequest, body map[strin
 }
 
 func (s *Service) upstreamStream(request ExecutorRequest, body map[string]any, c credential) (upstreamStream, error) {
-	return s.upstreamStreamAttempt(request, body, c, true)
+	for attempt := 0; ; attempt++ {
+		stream, err := s.upstreamStreamAttempt(request, body, c, true)
+		if isStaleAttachmentOwnership(err) {
+			// 缓存的 file_id 已失效：清掉缓存让下一轮重新上传；同一个请求体重试必然再失败。
+			s.attachments.reset()
+			return stream, err
+		}
+		delay, retry := rateLimitRetryDelay(stream.StatusCode, stream.Headers, attempt)
+		if !retry {
+			return stream, err
+		}
+		s.wait(delay)
+	}
 }
 
 func (s *Service) upstreamStreamAttempt(request ExecutorRequest, body map[string]any, c credential, allowEncryptedRetry bool) (upstreamStream, error) {
@@ -394,4 +419,54 @@ func prepareEncryptedContentRetry(body map[string]any, status int, raw []byte) (
 	retry := cloneObject(body)
 	retry["input"] = kept
 	return retry, true
+}
+
+// 429/503 与上游 5xx（500/502/504）都是"稍后再试"，不是账号故障：BPS 的 requests/minute 是
+// 账号级配额，同一账号的其它客户端（例如网页端）也会消耗它。把这类错误直接透传给客户端会
+// 诱发"整轮重试"——每轮都要重新上传历史图片，反而把配额烧得更干。这里做有界重试，
+// 等待时间设上限以免把请求挂太久。
+const (
+	rateLimitRetryLimit       = 2
+	rateLimitRetryBackoffBase = time.Second
+	rateLimitRetryBackoffMax  = 8 * time.Second
+)
+
+// rateLimitRetryDelay 决定是否重试以及等待多久。上游给了 Retry-After 就按它等（仅在合理范围内）；
+// 要求的等待超过 rateLimitRetryBackoffMax 时放弃重试——此时重试只是拖延，交给客户端自己退避。
+func rateLimitRetryDelay(status int, headers http.Header, attempt int) (time.Duration, bool) {
+	if attempt >= rateLimitRetryLimit {
+		return 0, false
+	}
+	switch status {
+	case http.StatusTooManyRequests, http.StatusServiceUnavailable,
+		http.StatusInternalServerError, http.StatusBadGateway, http.StatusGatewayTimeout:
+	default:
+		return 0, false
+	}
+	if raw := strings.TrimSpace(headers.Get("Retry-After")); raw != "" {
+		seconds, err := strconv.Atoi(raw)
+		if err != nil {
+			return 0, false
+		}
+		delay := time.Duration(seconds) * time.Second
+		if delay > rateLimitRetryBackoffMax {
+			return 0, false
+		}
+		return delay, true
+	}
+	delay := rateLimitRetryBackoffBase << uint(attempt)
+	if delay > rateLimitRetryBackoffMax {
+		delay = rateLimitRetryBackoffMax
+	}
+	return delay, true
+}
+
+// isStaleAttachmentOwnership 认出上游"附件归属校验失败"的 500：说明我们复用的 file_id
+// 在上游已经失效（过期或被清理），既不是账号故障，重试同一个请求体也没有意义——
+// 清掉附件缓存让下一轮重新上传即可自愈。
+func isStaleAttachmentOwnership(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "file ownership")
 }

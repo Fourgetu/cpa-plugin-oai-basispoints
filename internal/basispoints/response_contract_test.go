@@ -52,7 +52,7 @@ func TestRelayRegenerationHTTP(t *testing.T) {
 						t.Error("stream mode changed")
 					}
 					hasHint := strings.Contains(string(jsonBytes(sent)), transportRetryHint)
-					if hasHint != (attempts == 2) {
+					if mode != "upstream_error" && hasHint != (attempts == 2) {
 						t.Error("retry hint missing or present on first attempt")
 					}
 					if mode == "upstream_error" {
@@ -78,6 +78,7 @@ func TestRelayRegenerationHTTP(t *testing.T) {
 				}))
 				defer server.Close()
 				svc := NewService()
+				svc.sleep = func(time.Duration) {}
 				svc.cfg.ResponsesURL = server.URL
 				var upstream []byte
 				var emitted []byte
@@ -128,7 +129,11 @@ func TestRelayRegenerationHTTP(t *testing.T) {
 				}
 				result, err := svc.Handle(method, jsonBytes(req))
 				wantAttempts := 1
-				if strings.HasSuffix(mode, "recover") || strings.HasSuffix(mode, "exhausted") {
+				switch {
+				case mode == "upstream_error":
+					// 429 自 0.2.2-pro.4 起会退避重试：首次 + 重试上限次。
+					wantAttempts = rateLimitRetryLimit + 1
+				case strings.HasSuffix(mode, "recover"), strings.HasSuffix(mode, "exhausted"):
 					wantAttempts = 2
 				}
 				if attempts != wantAttempts {

@@ -283,6 +283,7 @@ func registration(cfg Config) map[string]any {
 				{"Name": "max_response_bytes", "Type": "integer", "Description": "Maximum upstream response size."},
 				{"Name": "auth_mode", "Type": "string", "Description": "Basis Points authentication mode; normally chatgpt."},
 				{"Name": "tools_version_id", "Type": "string", "Description": "Optional authoritative Basis Points tools catalog version."},
+				{"Name": "max_request_inline_images", "Type": "integer", "Description": "单个请求允许的内联图片张数上限（默认 512，范围 1–4096）。体积/像素闸门固定，不受此项影响。"},
 			},
 		},
 		"capabilities": map[string]any{

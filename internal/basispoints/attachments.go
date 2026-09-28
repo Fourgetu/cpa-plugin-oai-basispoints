@@ -24,11 +24,15 @@ import (
 const maxAttachmentCacheEntries = 512
 
 // 上传前的整体预检上限：全部校验通过后才开始上传，避免失败时留下孤儿附件。
+// 张数上限是准入护栏，不是上游硬限制（上游没有声明过该限制，官方插件也没有）：
+// 默认 defaultMaxRequestInlineImages，可用插件配置 max_request_inline_images 调整。
+// 真正约束上游请求体的是体积/像素三道闸门，它们保持固定值。
 const (
-	maxRequestInlineImages = 20
-	maxInlineImageBytes    = 20 << 20
-	maxRequestInlineBytes  = 32 << 20
-	maxInlineImagePixels   = 64 << 20
+	defaultMaxRequestInlineImages = 512
+	maxRequestInlineImagesLimit   = 4096
+	maxInlineImageBytes           = 20 << 20
+	maxRequestInlineBytes         = 32 << 20
+	maxInlineImagePixels          = 64 << 20
 )
 
 type cachedAttachment struct {
@@ -218,6 +222,10 @@ func (s *Service) uploadInputImages(request ExecutorRequest, body map[string]any
 	var relocations []toolImageRelocation
 	toolImageIndex := map[int]int{}
 	imageCount := 0
+	imageLimit := cfg.MaxRequestInlineImages
+	if imageLimit <= 0 {
+		imageLimit = defaultMaxRequestInlineImages
+	}
 	totalBytes := 0
 	for i, value := range items {
 		item := objectValue(value)
@@ -241,8 +249,8 @@ func (s *Service) uploadInputImages(request ExecutorRequest, body map[string]any
 			}
 			imageURL := stringValue(part["image_url"])
 			isData := len(imageURL) >= 5 && strings.EqualFold(imageURL[:5], "data:")
-			if imageCount >= maxRequestInlineImages {
-				return fail(400, "invalid_image", fmt.Sprintf("a request may contain at most %d inline images", maxRequestInlineImages))
+			if imageCount >= imageLimit {
+				return fail(400, "invalid_image", fmt.Sprintf("a request may contain at most %d inline images", imageLimit))
 			}
 			if err := validateImageDetail(part["detail"]); err != nil {
 				return err

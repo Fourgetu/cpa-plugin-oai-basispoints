@@ -1,5 +1,14 @@
 # 更新日志
 
+## v0.2.2-pro.3 — 2026-09-29（fork，未发布）
+
+**图片张数上限改为可配置（方案 A）**。旧值 `maxRequestInlineImages = 20` 是我们从 sub2api 继承的**准入护栏**，不是上游硬限制；它会把长会话锁死：Codex 每轮重发完整历史，工具截图逐轮累积，到第 21 张起永久 400（实测触发请求 285 个 input 条目、21 张图、**总体积仅 1.27 MiB**），只能 `/compact` 或开新会话。
+
+- 新增插件配置 **`max_request_inline_images`**（integer，默认 **512**，范围 **1–4096**）：`attachments.go` 引入 `defaultMaxRequestInlineImages`/`maxRequestInlineImagesLimit`，`Config` 新增 `MaxRequestInlineImages`，`normalize()` 里 0 回落默认、越界报 `invalid_config`；管理面板 `ConfigFields` 同步列出该项。
+- **体积/像素三道闸门保持不变**（单图解码后 ≤20 MiB、整请求累计 ≤32 MiB、解码后 ≤64 MP）：真正约束上游请求体的是它们，默认 512 张下它们仍然先触发。
+- **上限溯源**：数字出自 sub2api `image_relay.go:34-44`（`NOTICE.md` 说明端口自 hloolx/codex2api commit `4dea83ec` "HTTPS image references"），服务的是它们**自己的临时 HTTPS 图床**（`/api/bps-images/`、30 分钟 TTL、图片落自己磁盘再镜像给上游），是**多租户网关对自己磁盘/带宽**设的准入护栏；sub2api 自己在 v2.8.14 就把它做成可配（`MaxImages` 1–4096），上游官方插件 v0.1.14 完全没有张数/体积限制。实测：工具结果 8 张 `data:` → 上游 200；24 张从未到达上游（本地拦下）。
+- **测试**：`TestInlineImageLimitFollowsConfiguration`（0 回落默认并放行 21 张、配置值生效、超限 400 且错误信息带实际数值）、`TestInlineImageLimitConfigValidation`（0 → 默认；-1 与 4097 → 400 `invalid_config`；上界放行）；`TestInlineImagePreflightRejectsBeforeAnyUpload` 的 count 用例改用默认上限。
+
  ## v0.2.2-pro.2 — 2026-09-28（fork，未发布）
 
  第二批吸收自上游 v0.2.x 与 [ranxi2001/sub2api](https://github.com/ranxi2001/sub2api) v2.8.19 的适用修复（基于 0.2.2-pro.1），两项都只改上游请求构造、不改交付语义：

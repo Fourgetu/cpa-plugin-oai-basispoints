@@ -1,7 +1,7 @@
- # Fourgetu fork 说明（分支 `prod/v0.1.14`，版本 `0.2.2-pro.2`）
+# Fourgetu fork 说明（分支 `prod/v0.2.2`，版本 `0.2.2-pro.3`）
 
 本仓库是 [JaxsonWang/cpa-plugin-oai-basispoints](https://github.com/JaxsonWang/cpa-plugin-oai-basispoints) 的 fork，发布在 [Fourgetu/cpa-plugin-oai-basispoints](https://github.com/Fourgetu/cpa-plugin-oai-basispoints)。
- 分支 `prod/v0.1.14` 以上游 **v0.1.14**（commit `1b9359a`）为**代码基线**。**从 0.2.2-pro.1 起 `Version` 跟随上游版本线**：上游最新 v0.2.2 → 本版 `0.2.2-pro.2`，tag 仍 = `v` + `Version`（即 `v0.2.2-pro.2`）；版本号只表示兼容性对齐点（吸收到上游 v0.2.2 时点适用的修复），代码仍是 v0.1.14 基线 + 自研增量流式桥——**未采纳**上游 v0.1.18 的 streaming 重写与 v0.2.0 的 WS 传输（上游自家生产部署里 WS 握手持续 404、其验证文档也不主张性能收益，故观望）。在上游之上保留五处生产验证过的改动、一组有界的工具封装纠错（对齐 sub2api v2.8.15）、一组能力/校验边界（对齐上游 v0.1.15–v0.1.18 与 sub2api v2.8.16，见第 8 节）、命令原文直传与附件预检一组（对齐 sub2api 的 BPS 协议实践，见第 9、10 节）、第一批上游 v0.2.x / sub2api v2.8.19 修复（见第 11 节），以及第二批 sub2api v2.8.19 修复——工具结果图片落位与多代理协作历史归一化（见第 12 节）。
+ 分支 `prod/v0.2.2` 以上游 **v0.1.14**（commit `1b9359a`）为**代码基线**。**从 0.2.2-pro.1 起 `Version` 跟随上游版本线**：上游最新 v0.2.2 → 本版 `0.2.2-pro.3`，tag 仍 = `v` + `Version`（即 `v0.2.2-pro.3`）；版本号只表示兼容性对齐点（吸收到上游 v0.2.2 时点适用的修复），代码仍是 v0.1.14 基线 + 自研增量流式桥——**未采纳**上游 v0.1.18 的 streaming 重写与 v0.2.0 的 WS 传输（上游自家生产部署里 WS 握手持续 404、其验证文档也不主张性能收益，故观望）。在上游之上保留五处生产验证过的改动、一组有界的工具封装纠错（对齐 sub2api v2.8.15）、一组能力/校验边界（对齐上游 v0.1.15–v0.1.18 与 sub2api v2.8.16，见第 8 节）、命令原文直传与附件预检一组（对齐 sub2api 的 BPS 协议实践，见第 9、10 节）、第一批上游 v0.2.x / sub2api v2.8.19 修复（见第 11 节）、第二批 sub2api v2.8.19 修复——工具结果图片落位与多代理协作历史归一化（见第 12 节），以及图片张数上限可配置（见第 13 节）。
 
 除本文列出的差异外，其余行为与 v0.1.14 一致；上游代码、MIT 许可证与版权声明原样保留。
 
@@ -160,7 +160,7 @@ docker run --rm -v "$PWD":/src -w /src golang:1.26 sh -c '
  配套不变量：
 
  - **用户/系统消息与 `agent_message` 里的内联图片照常上传成附件引用**，不受本修复影响（探针只针对工具结果位置；pro.4/pro.1 的用户消息与 agent_message 路径不变）。
- - **图片张数限额统一计数**：消息内联图片 + 工具截图（`data:`，不上传也计数）+ 搬迁引用共用一次请求 ≤20 张的额度；体积/像素/`detail` 校验同样覆盖。
+- **图片张数限额统一计数**：消息内联图片 + 工具截图（`data:`，不上传也计数）+ 搬迁引用共用同一次请求的张数额度（0.2.2-pro.3 起由 `max_request_inline_images` 决定，默认 512，见第 13 节；此前是继承 sub2api 的固定 20 张）；体积/像素/`detail` 校验同样覆盖。
  - 工具结果里的 `file_id` 引用加**形态校验**（`file-` 前缀 + 6..256 长度 + `[A-Za-z0-9_-]` 字符集）：非法引用在预检阶段 400，不做任何上传或改写。
  - 测试钉在 `tool_images_test.go`：搬迁布局与标签文本、多图交替、`data:` 与引用混合各自处理、非法 `file_id` 预检拒绝、截图超限仍拒绝、用户消息照常上传且不多发上传请求。
 
@@ -187,3 +187,14 @@ docker run --rm -v "$PWD":/src -w /src golang:1.26 sh -c '
  ### 已知不做
 
  - **WS 传输与源认证菜单**：继续观望。上游自家生产部署里 WS 握手持续 404，其验证文档也不主张性能收益；现有 SSE 增量桥 + 15s 保活够用。
+
+## 13. 图片张数上限可配置（0.2.2-pro.3）
+
+动机：Codex 每轮重发完整历史，工具截图逐轮累积；`attachments.go` 里从 sub2api 继承的 `maxRequestInlineImages = 20` 到第 21 张起永久 400，长会话被锁死（实测触发请求 285 个 input 条目、21 张图、**总体积仅 1.27 MiB**），只能 `/compact` 或开新会话。
+
+- **上限溯源（别人为什么加这个限制）**：数字出自 sub2api `backend/internal/service/basispoints/image_relay.go:34-44`，其 `NOTICE.md` 说明该包移植自 `hloolx/codex2api`（commit `4dea83ec` "HTTPS image references"）。那组常量（1 GiB 磁盘 / 512 条目 / 单图 20 MiB / 单请求 32 MiB / 20 张 / 64 MP）服务的是**它们自己的临时 HTTPS 图床**（`/api/bps-images/`，30 分钟 TTL，图片落自己磁盘再用 HTTPS 镜像给上游），是**多租户网关对自己磁盘与带宽**设的准入护栏；`imageRelayMaxRequestImages` 只在该暂存路径里生效（native 模式复用同一套护栏）。错误文案 "basispoints accepts at most 20 inline images per request" 把自家常量说成上游规矩，我们 0.2.2-pro.1 抄了这句。
+- **不是已验证的上游限制**：sub2api 在 v2.8.14 就把它做成可配置（`MaxImages` 1–4096）——他们也不知道真实上限；上游官方插件 `v0.1.14` 的 `attachments.go` 只有 `maxAttachmentCacheEntries = 512`，**没有任何张数/体积校验**；我们的探针里工具结果 8 张 `data:` → 上游 **200**，24 张那次是**我们本地拦下**（请求没到上游）。
+- **本版做法（方案 A）**：新增插件配置 `max_request_inline_images`（integer，默认 **512**，范围 **1–4096**）。`Config` 新增该字段、`defaultConfig()` 与 `normalize()` 同步（0 → 回落默认，越界 → `invalid_config` 400），管理面板 `ConfigFields` 列出该项；`uploadInputImages` 用 `cfg.MaxRequestInlineImages`（≤0 回落 `defaultMaxRequestInlineImages`）替换旧常量判据，错误信息带上实际数值。
+- **体积/像素闸门不动**：单图解码后 ≤20 MiB、整请求累计 ≤32 MiB、解码后 ≤64 MP——真正约束上游请求体的是这三道；默认 512 张下它们仍先触发（1.27 MiB / 21 张这种历史离闸门很远，正是当初被张数卡死的原因）。
+- **测试**：`TestInlineImageLimitFollowsConfiguration`（0 回落默认并放行 21 张、配置值生效、超限 400 带实际数值）、`TestInlineImageLimitConfigValidation`（0 → 默认；-1 与 4097 → 400 `invalid_config`；上界放行）；`TestInlineImagePreflightRejectsBeforeAnyUpload` 的 count 用例改用默认上限构造 513 张。
+- **刻意没做**：不加"超限就从最老的历史截图开始丢弃"（方案 B）——超限仍报错，保持行为可解释；若长会话体积真的逼近 32 MiB 闸门再谈。

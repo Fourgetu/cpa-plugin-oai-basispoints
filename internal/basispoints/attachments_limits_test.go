@@ -48,15 +48,15 @@ func TestInlineImagePreflightRejectsBeforeAnyUpload(t *testing.T) {
 	tooManyPixels := paddedPNGDataURL(100000, 1000, 0)
 	mediaTypeMismatch := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(headerOnlyPNG(3, 2))
 	undecodable := "data:image/png;base64," + base64.StdEncoding.EncodeToString([]byte("not an image"))
-	countParts := make([]any, 0, maxRequestInlineImages+1)
-	for range maxRequestInlineImages + 1 {
-		countParts = append(countParts, imagePart(tiny))
+	limitParts := make([]any, 0, defaultMaxRequestInlineImages+1)
+	for range defaultMaxRequestInlineImages + 1 {
+		limitParts = append(limitParts, imagePart(tiny))
 	}
 	for _, tc := range []struct {
 		name  string
 		parts []any
 	}{
-		{"count", countParts},
+		{"count", limitParts},
 		{"single-image-size", []any{imagePart(oversized)}},
 		{"request-total-size", []any{imagePart(seventeenMiB), imagePart(seventeenMiB)}},
 		{"pixel-count", []any{imagePart(tooManyPixels)}},
@@ -218,5 +218,68 @@ func TestUpstreamDiagnosticCountsToolOutputImages(t *testing.T) {
 	err := upstreamRequestError(500, jsonBytes(map[string]any{"message": "boom"}), body, credential{})
 	if !strings.Contains(err.Error(), "input_images=3") || !strings.Contains(err.Error(), "original_detail_images=1") {
 		t.Fatalf("diagnostic missed tool output images: %v", err)
+	}
+}
+
+// 张数上限现在由配置决定：默认 defaultMaxRequestInlineImages，未设置时回落默认，
+// 越界由配置校验拒绝。旧值 20 会把长会话锁死，所以默认值必须远大于历史长度。
+func TestInlineImageLimitFollowsConfiguration(t *testing.T) {
+	tiny, _ := testImageDataURL(t)
+	parts := func(n int) []any {
+		out := make([]any, 0, n)
+		for range n {
+			out = append(out, imagePart(tiny))
+		}
+		return out
+	}
+	service := NewService()
+	service.SetHost(func(_ string, _ any, out any) error {
+		*out.(*upstreamResponse) = upstreamResponse{StatusCode: 200, Body: jsonBytes(map[string]any{"openai_file_id": "file-uploaded"})}
+		return nil
+	})
+	if got := defaultConfig().MaxRequestInlineImages; got != defaultMaxRequestInlineImages {
+		t.Fatalf("default limit = %d, want %d", got, defaultMaxRequestInlineImages)
+	}
+	// 未设置（0）时回落默认上限：21 张不再被拒。
+	cfg := defaultConfig()
+	cfg.MaxRequestInlineImages = 0
+	if err := service.uploadInputImages(ExecutorRequest{}, contentBody(parts(21)...), credential{}, cfg); err != nil {
+		t.Fatalf("21 images with fallback limit: %v", err)
+	}
+	// 配置值生效：等于上限放行，超出上限报 400 且带上实际数值。
+	cfg.MaxRequestInlineImages = 3
+	if err := service.uploadInputImages(ExecutorRequest{}, contentBody(parts(3)...), credential{}, cfg); err != nil {
+		t.Fatalf("3 images at limit 3: %v", err)
+	}
+	err := service.uploadInputImages(ExecutorRequest{}, contentBody(parts(4)...), credential{}, cfg)
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != 400 || !strings.Contains(apiErr.Message, "at most 3 inline images") {
+		t.Fatalf("err=%v, want 400 mentioning at most 3", err)
+	}
+}
+
+// 配置校验：0 表示未设置并回落默认；越界（含负数）在加载阶段就以 invalid_config 拒绝。
+func TestInlineImageLimitConfigValidation(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.MaxRequestInlineImages = 0
+	if err := cfg.normalize(); err != nil {
+		t.Fatalf("normalize zero limit: %v", err)
+	}
+	if cfg.MaxRequestInlineImages != defaultMaxRequestInlineImages {
+		t.Fatalf("normalized limit = %d, want %d", cfg.MaxRequestInlineImages, defaultMaxRequestInlineImages)
+	}
+	for _, limit := range []int{-1, maxRequestInlineImagesLimit + 1} {
+		invalid := defaultConfig()
+		invalid.MaxRequestInlineImages = limit
+		err := invalid.normalize()
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || apiErr.Status != 400 || !strings.Contains(apiErr.Message, "max_request_inline_images") {
+			t.Fatalf("limit %d: err=%v, want 400 invalid_config", limit, err)
+		}
+	}
+	bound := defaultConfig()
+	bound.MaxRequestInlineImages = maxRequestInlineImagesLimit
+	if err := bound.normalize(); err != nil {
+		t.Fatalf("normalize upper bound: %v", err)
 	}
 }

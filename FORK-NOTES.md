@@ -166,6 +166,8 @@ docker run --rm -v "$PWD":/src -w /src golang:1.26 sh -c '
 
  ### P0-C 多代理协作历史归一化
 
+**⚠ 上游 v0.2.5 的反证（2026-09-29；本节做法我们暂保留，触发判据见第 17 节）**：上游曾用同样的思路（剥掉 `author`/`recipient`、只保留 `type: agent_message`）部署，**真实收到 400 `Missing required parameter: 'input[29].author'.`**，于是撤回为"原样透传"。我们连 `type` 一起改成 `message`，因此不会触发那条必填，但存在语义失真（丢协作路由身份 + 注入合成正文）；我方线上日志里这三个特征各 0 命中，该路径至今未被执行。
+
  动机：上游对 message 条目拒绝 `author`/`recipient` 字段、也不接受 `agent_message` 条目；此前全量透传，多代理协作历史（如带 `author: /root/worker` 的分工记录）每次请求 400。`normalizeHistoryMessage` 在 `translateInputItems` 内执行（对齐 sub2api v2.8.19 history_messages.go），转换细节：
 
  - **归属元数据 → JSON 前缀文本**：`message` 条目的 `author`/`recipient`（及其它会被上游拒收的归属字段）序列化成 JSON，作为正文开头的说明部件，前缀 "Message attribution metadata (context only): "；条目其余字段原样保留。
@@ -251,3 +253,24 @@ docker run --rm -v "$PWD":/src -w /src golang:1.26 sh -c '
 - sub2api v2.8.20 的"BPS 429 专项账号调度"与 v2.9.x 的图片策略（off/warning/auto_compact，需要 Redis + checkpoint + 客户端回显）架构不匹配（我们是单凭据 CPA 插件、没有账号池与暂存图床），不搬。
 
 **测试**：新增 `upload_format_test.go`（字节签名决定文件名与 Content-Type 5 例含"声明 WebP 但无编码器"、白名单外字节本地 400 且带位置、`image_refs` 诊断与不泄漏断言、429 带 `retry_after=Ns`）；`attachments_limits_test.go` 去掉"声明与字节不符即拒"的用例（按字节为准后该情形会被正常上传）。
+
+## 17. 与上游 v0.2.5 的分歧：`agent_message` 历史归一化（**暂不改，留触发判据**）
+
+上游 v0.2.5（`b8c4023`，2026-09-29）**没有可搬的代码改动**（`protocol.go` 只加了一行注释、`types.go` 只是版本号，其余是 `CHANGELOG`/`README`/`docs/validation/v0.2.5.md` 与新增 325 行测试），但它的结论和我们 0.2.2-pro.2 的 P0-C（见第 12 节）相反，故单独留档。
+
+**上游的做法与证据**：`author`/`recipient` 一律原样保留（其测试第 52–58 行要求连 `message` 与未知类型条目都不许动），`agent_message` 保留原类型与正文、不插标注、不给缺失字段伪造身份、畸形正文不修。依据是一手证据：他们曾把这两个字段剥掉、用正文标记替代（**保留 `type: agent_message`**），部署后**真实收到 400 `Missing required parameter: 'input[29].author'.`**，于是完整撤回；另有 6 次真机验收（5×200 + 1×400 负向对照，2026-09-29）。
+
+**我们的做法**：`normalizeHistoryMessage`（`protocol.go`）会把**任何** `agent_message` 整条重写成 `{type: message, role: user, content: [合成标注文本, ...原内容]}`（连完全没有 `author`/`recipient` 的那例也一样），并把 `message` 上的 `author`/`recipient` 抽成正文前缀 `Message attribution metadata (context only): {...}`；畸形/缺失 `content` 会被序列化成正文（缺失时造出 `"text":"null"`）。
+
+**只读对照（2026-09-29）**：把上游那 325 行测试的断言原样搬到我们实现上跑（仓库临时副本 `/root/cpa/plugin-fork/p6-compare`，未改仓库、未动线上），结果 **14 个子用例失败 / 2 通过**；唯一一致的是"未知类型条目原样透传"。完整 want/got 见 `docs/validation/v0.2.5-compare-vs-pro.2.md`；对照用例 `p6_compare_test.go` 与原始输出 `p6-compare.out` 留在工作区（**刻意不入库**：它按设计会失败，入了解会弄挂 CI）。
+
+**为什么暂不改**：① 我方客户端（Codex 桌面 / Excel 加载项）的多代理协作走**文本协议**（`Sender: <author>` 写在 developer 消息正文里），约 100 MB 线上日志（含失败请求 dump）里 `"author"`、`recipient`、`"type":"agent_message"` **各 0 命中**——该路径至今从未被执行，没有收益，也没有我们自己的失败证据；② 我们把 `type` 一起改掉，因此**不会触发上游那条 author 必填**——问题不是报错，而是语义失真（丢掉协作路由身份、往 prompt 注入我们写的合成正文、把"明确 400"变成"静默改写后再发"）。
+
+**触发判据（命中任一即执行下面的回退）**：
+
+1. 日志或失败请求 dump 里出现 `"author"` / `"recipient"` / `"type":"agent_message"`（客户端开始发原生协作条目）；
+2. 出现多代理协作相关的上游 4xx，尤其 `Missing required parameter: 'input[...].author'` 或 `agent_message` 字段类报错；
+3. 用户报告"子代理/多代理协作上下文丢失"，或"模型把协作内容当成用户指令"；
+4. Codex 侧发布说明提到协作条目改用原生 `agent_message`（不再走文本协议）。
+
+**回退动作（届时执行，等于对齐上游 v0.2.5）**：`translateInputItems` 不再调用 `normalizeHistoryMessage`——`author`/`recipient` 与 `agent_message` 一律原样透传、缺失字段不伪造、畸形内容不修；测试照搬上游 `agent_message_routing_test.go` 的用例形态（我们只搬 HTTP 版：WS 版依赖 `gorilla/websocket` 与 WS 传输，本分支没有）；同步改写 `history_messages_test.go` 的 P0-C 用例，以及本节、第 12 节、README 差异表第 14 行、CHANGELOG 的 pro.2 条目。

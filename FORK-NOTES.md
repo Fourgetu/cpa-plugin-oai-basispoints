@@ -233,3 +233,21 @@ docker run --rm -v "$PWD":/src -w /src golang:1.26 sh -c '
 - 加/删模型**只改 CPA 配置**（`models` + `model_mappings`），不需要改插件代码；示例见 `config.example.yaml`。
 - 生产侧本次改动：`/root/cpa/config.yaml` 增加这两个别名（备份 `config.yaml.bak-6sol-probe-20260928-151944`），热重载生效；回滚 = `bash /root/cpa/plugin-patched/vps_alias_probe_6sol.sh revert`。
 - 复核：改后 `vps_check_0222.sh` 通过（6 个别名、模型总数 65、冒烟 `ttfb 2465ms / total 3079ms / deltas 2 / failed 0`）。
+
+## 16. 图片上传格式判定、图片诊断与 429 提示（0.2.2-pro.5）
+
+搬运上游 v0.2.4（`08e349c`）与 sub2api v2.8.20 里与图片/诊断有关的三处，都只改"上游请求构造与错误文案"，不动交付语义：
+
+- **上传文件名/格式按字节签名判定**（对齐上游 v0.2.4 issue #15）：新增 `uploadedImageFormats`（`image/png→.png`、`image/jpeg→.jpeg`、`image/gif→.gif`、`image/webp→.webp`）与 `uploadedImageFormat(data)`（`http.DetectContentType` + RIFF/WEBP 兜底，因为对没有编码器的 WebP 字节 `DetectContentType` 只给 `application/octet-stream`）；`inlineImage` 增加 `filename` 字段，`decodeInlineImage` 用签名结果覆盖声明的 MIME，`uploadImage` 直接用 `attachment.filename`，**删掉 `mime.ExtensionsByType`**。
+  - 这个隐患是实测确认的：我们环境里 `mime.ExtensionsByType("image/jpeg")` 返回 `[.jfif .jpe .jpeg .jpg .pjp .pjpeg]`（取 `[0]` = `.jfif`），声明 `image/jpg` 更是空列表（文件名无后缀）。两者都不在上游白名单（`.jpeg .jpg .png .gif .webp`）里，会以 `Invalid input: Expected image type to be a supported format: .jpeg, .jpg, .png, .gif, .webp but got none` 拒掉整条请求。CPA 容器里没有 `/etc/mime.types`，所以一直侥幸取到 `.jpeg`；线上历史 142 次图片声明**全是 `data:image/png`**，该坑至今没在生产触发过（日志里该上游报错 0 命中）。
+  - 上传路径遇到白名单外的字节签名（例如 BMP）现在**本地**就 `fail(400, "invalid_image", "...bytes must identify a supported format: PNG, JPEG, GIF, or WebP")`，不把问题留给上游。
+- **图片诊断**：本地图片类错误的文案带位置 `input[i].content[j]` / `input[i].output[j]`（`imagePosition` / `withImagePosition`，只加定位、保留原状态码与错误类别）；上游返回的图片类错误追加 `image_refs`（最多 `maxImageRefs = 16` 条 `位置:类型`，类型为 `data_url`/`image_url`/`file_id`/`missing`，超出的记 `,...(N more)`）——**只给位置与类型，不含 URL、file_id 或图片内容**。
+- **429 的 `Retry-After` 提示**（对齐 sub2api v2.8.20 的处理意图）：`withRetryHint` 在上游 429 最终失败时把可解析的 `Retry-After` 以 `; retry_after=Ns` 附到错误正文，接线在 `upstreamRequest` / `upstreamStream` / `uploadImage` 三处。
+  - **局限（ABI 决定，不是没做）**：CPA 的插件执行器 ABI 没有"错误响应头"通道——核对 7.3.17 源码，`pluginapi.ExecutorResponse` 只有 `Payload`/`Headers`，HTTP 状态码由 CPA 决定；响应拦截器只在成功路径被调用且固定传 `StatusOK`（线上 7.3.19 同构）。所以这条只在**文本与日志**层生效，真正的下游响应头（如 `x-retry-metadata`）由 CPA 自己的重试逻辑产出。
+
+**刻意没做**：
+
+- 上游 v0.2.4 同批的 **#17「回填不带 `detail`」不采纳**：我们有反证——2026-09-28 14:00 的请求 dump 里带 `detail:"high"` 的 `file_id` 请求，上游回的是 500 归属校验失败而不是 422（即 `detail` 不是这批 400/422 的成因），且 `detail: original` 对截图保真有用。上游那一项只用本地夹具验证、未做远端对照。
+- sub2api v2.8.20 的"BPS 429 专项账号调度"与 v2.9.x 的图片策略（off/warning/auto_compact，需要 Redis + checkpoint + 客户端回显）架构不匹配（我们是单凭据 CPA 插件、没有账号池与暂存图床），不搬。
+
+**测试**：新增 `upload_format_test.go`（字节签名决定文件名与 Content-Type 5 例含"声明 WebP 但无编码器"、白名单外字节本地 400 且带位置、`image_refs` 诊断与不泄漏断言、429 带 `retry_after=Ns`）；`attachments_limits_test.go` 去掉"声明与字节不符即拒"的用例（按字节为准后该情形会被正常上传）。

@@ -1,6 +1,6 @@
 # CPA OpenAI Basis Points 插件
 
- > 本仓库是 [Fourgetu](https://github.com/Fourgetu) 的 fork：代码基线为上游 v0.1.14，版本号 `0.2.2-pro.2`（从 0.2.2-pro.1 起跟随上游版本线：0.2.2-pro.2 = 对齐上游 v0.2.2 时点的修复集，不含上游 v0.1.18 streaming 重写与 v0.2.0 WS 传输）。相对上游的改动、分流条件与取舍见 [FORK-NOTES.md](FORK-NOTES.md)，更新日志见 [CHANGELOG.md](CHANGELOG.md)。上游代码、MIT 许可证与版权声明原样保留。
+> 本仓库是 [Fourgetu](https://github.com/Fourgetu) 的 fork：代码基线为上游 v0.1.14，版本号 `0.2.2-pro.5`（从 0.2.2-pro.1 起跟随上游版本线：0.2.2-pro.N = 对齐上游 v0.2.2 时点的修复集，不含上游 v0.1.18 streaming 重写与 v0.2.0 WS 传输）。相对上游的改动、分流条件与取舍见 [FORK-NOTES.md](FORK-NOTES.md)，更新日志见 [CHANGELOG.md](CHANGELOG.md)。上游代码、MIT 许可证与版权声明原样保留。
 这是一个 CLIProxyAPI（CPA）原生插件，用 CPA 已有的 ChatGPT/Codex OAuth 凭据直接请求。
 
 ## 通过 CPA 插件商店安装（推荐）
@@ -8,7 +8,7 @@
 在管理界面的「第三方插件源 → 插件源 registry URL (plugins.store-sources)」中添加以下地址并保存，然后刷新插件商店，搜索 **CPA OpenAI Basis Points**：
 
 ```text
- https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/v0.2.2-pro.2/registry.json
+ https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/v0.2.2-pro.5/registry.json
 ```
 
 也可合并到 CPA **宿主配置**（`config.yaml`，与下方插件配置共用同一个 `plugins` 节点）：
@@ -17,7 +17,7 @@
 plugins:
   enabled: true
   store-sources:
-     - https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/v0.2.2-pro.2/registry.json
+     - https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/v0.2.2-pro.5/registry.json
 ```
 
 保留已有插件源，不要整体覆盖原有 `plugins` 配置；内置官方源由 CPA 自动保留。本源使用宿主原生的 `github-release` 安装方式，最新版本以本仓库已发布的 GitHub Release 为准，不在 registry 中另行维护版本号。CPA 会按运行平台下载 `oai-basispoints_<version>_<goos>_<goarch>.zip`，并使用同一 Release 的 `checksums.txt` 校验。本仓库的 `main` 分支就是本 fork 的默认分支，内容与最新 tag 一致（只多文档更新）；想跟随最新代码也可以用 `https://raw.githubusercontent.com/Fourgetu/cpa-plugin-oai-basispoints/main/registry.json`，上面的 tag 地址则用于钉住具体版本。
@@ -46,6 +46,7 @@ plugins:
  | 14 | 多代理协作历史归一化：`message` 的 `author`/`recipient` 归属元数据序列化成 JSON 作为正文开头说明文本，`agent_message` 降级为带标注的 user 消息，assistant 说明用 `output_text` 部件，畸形正文序列化成可读文本兜底 | 上游对 message 条目拒绝 `author`/`recipient` 字段、不接受 `agent_message` 条目；此前全量透传，多代理协作历史每次请求 400 |
 | 15 | 图片张数上限改为可配置 `max_request_inline_images`（integer，默认 512，范围 1–4096），体积/像素三道闸门（单图 20 MiB / 累计 32 MiB / 64 MP）保持固定 | 旧值 20 是从 sub2api 继承的准入护栏、不是上游硬限制（上游官方插件没有任何张数/体积限制）；Codex 每轮重发全量历史、工具截图逐轮累积，第 21 张起永久 400 把长会话锁死（实测触发请求 285 条目、21 张图、总体积仅 1.27 MiB） |
 | 16 | 限速与上游 5xx 的鲁棒性：429/503/500/502/504 有界退避重试（读 `Retry-After`，上限 8s）；上游 5xx 改按内联失败交付（`response.failed` / `status=failed`，HTTP 200）不再让 CPA 冷却唯一凭据；附件缓存去掉 `access_token` 键、加 15 分钟有效期、容量可配（`max_attachment_cache_entries`） | 2026-09-28 实测：附件上传 429 会把客户端拖进"整轮重试→重传所有图片"；账号级 1000 次/分钟 429 与我们无关（我们只有 1–3 请求/分钟，同账号网页端在共用配额）；上游 500（复用过期 `file_id`）会以 5xx 交给 CPA → 凭据冷却 → 连打 9 次 503 |
+| 17 | 图片上传按**字节签名**定文件名与 Content-Type（PNG/JPEG/GIF/WebP 白名单，删掉 `mime.ExtensionsByType`）；图片类错误带位置，上游图片错误追加 `image_refs`（只给位置与类型）；429 最终失败时把 `Retry-After` 以 `retry_after=Ns` 附到错误正文 | 旧实现取 `ExtensionsByType(mediaType)[0]`：`image/jpeg` → `.jfif`（有 `/etc/mime.types` 的环境）、`image/jpg` → 空后缀，两者都不在上游白名单（`.jpeg .jpg .png .gif .webp`）里，会让整条请求被 400 `Invalid input: Expected image type to be a supported format`；CPA 容器里没有 mime.types 才一直侥幸取到 `.jpeg` |
 
 此外还有两处收紧，属于本分支对放行策略的加固：
 
@@ -84,6 +85,7 @@ make build
 - `code` 参数声明为 string 的函数工具支持"原始代码直传"：`summary` 放 `codex2api.function_code/<工具名>` 形态标记，`code` 放源码原文，其余参数作为一个 JSON 对象放在 `extended_summary`（没有该标记时一律按普通函数形状解析 `code`）。
 - 未能从 OAuth JWT 或凭据字段得到账号 ID、token 过期、上游返回非 2xx、工具名不在客户端目录中时，插件会报告明确错误，不伪造成功。
 - 内联图片预检：张数上限由插件配置 `max_request_inline_images` 控制（默认 512，范围 1–4096）；单图解码后 ≤20 MiB、整请求累计 ≤32 MiB、解码后 ≤64 MP 三道闸门固定。工具结果里的 `data:` 截图保留原样不改写，其中的 `file_id`/HTTPS 引用搬进紧随该结果的 user 消息。
+- 图片上传的文件名与 `Content-Type` 按**字节签名**判定（`http.DetectContentType` + PNG/JPEG/GIF/WebP 白名单，WebP 另有 RIFF 兜底），不再用声明 MIME 推断后缀；字节签名不在白名单内的图片在本地即 400，不发给上游。图片类错误带位置（`input[i].content[j]` / `input[i].output[j]`），上游图片错误附 `image_refs`（最多 16 条位置与类型，不含 URL、file_id 或图片内容）；上游 429 最终失败时错误正文附 `retry_after=Ns`（CPA 7.3.17 的插件执行器 ABI 没有错误响应头通道，这条只在文本与日志层生效）。
 
 ---
 

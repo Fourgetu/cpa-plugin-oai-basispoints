@@ -95,7 +95,7 @@ func (s *Service) upstreamRequest(request ExecutorRequest, body map[string]any, 
 		}
 		delay, retry := rateLimitRetryDelay(response.StatusCode, response.Headers, attempt)
 		if !retry {
-			return response, err
+			return response, withRetryHint(err, response.Headers)
 		}
 		s.wait(delay)
 	}
@@ -139,7 +139,7 @@ func (s *Service) upstreamStream(request ExecutorRequest, body map[string]any, c
 		}
 		delay, retry := rateLimitRetryDelay(stream.StatusCode, stream.Headers, attempt)
 		if !retry {
-			return stream, err
+			return stream, withRetryHint(err, stream.Headers)
 		}
 		s.wait(delay)
 	}
@@ -307,20 +307,39 @@ func upstreamRequestError(status int, raw []byte, body map[string]any, c credent
 	}
 	message := redactTokenMessage(errorMessage([]byte(redacted)))
 	images, originalDetails := 0, 0
+	var imageRefs []string
 	items, _ := body["input"].([]any)
-	for _, value := range items {
+	for i, value := range items {
 		entry := objectValue(value)
 		field := inlineImageField(entry)
 		if field == "" {
 			continue
 		}
 		parts, _ := entry[field].([]any)
-		for _, part := range parts {
-			if stringValue(objectValue(part)["type"]) == "input_image" {
-				images++
-				if stringValue(objectValue(part)["detail"]) == "original" {
-					originalDetails++
+		for j, part := range parts {
+			image := objectValue(part)
+			if stringValue(image["type"]) != "input_image" {
+				continue
+			}
+			images++
+			if stringValue(image["detail"]) == "original" {
+				originalDetails++
+			}
+			// 只记位置与引用类型：不输出 URL、file_id 或图片内容。
+			if len(imageRefs) < maxImageRefs {
+				kind := "missing"
+				switch {
+				case stringValue(image["file_id"]) != "":
+					kind = "file_id"
+				default:
+					if imageURL := stringValue(image["image_url"]); imageURL != "" {
+						kind = "image_url"
+						if len(imageURL) >= 5 && strings.EqualFold(imageURL[:5], "data:") {
+							kind = "data_url"
+						}
+					}
 				}
+				imageRefs = append(imageRefs, imagePosition(i, field, j)+":"+kind)
 			}
 		}
 	}
@@ -333,7 +352,14 @@ func upstreamRequestError(status int, raw []byte, body map[string]any, c credent
 			tier = "invalid"
 		}
 	}
-	return fail(status, "upstream_error", fmt.Sprintf("Basis Points HTTP %d: %s (reasoning_effort=%s; service_tier=%s; input_images=%d; original_detail_images=%d)", status, message, stringValue(body["reasoning_effort"]), tier, images, originalDetails))
+	imageSummary := ""
+	if images > 0 {
+		imageSummary = "; image_refs=" + strings.Join(imageRefs, ",")
+		if images > len(imageRefs) {
+			imageSummary += fmt.Sprintf(",...(%d more)", images-len(imageRefs))
+		}
+	}
+	return fail(status, "upstream_error", fmt.Sprintf("Basis Points HTTP %d: %s (reasoning_effort=%s; service_tier=%s; input_images=%d; original_detail_images=%d%s)", status, message, stringValue(body["reasoning_effort"]), tier, images, originalDetails, imageSummary))
 }
 
 // isEncryptedContentRejection 只认"明确说密文验不过"的 400：
@@ -469,4 +495,27 @@ func isStaleAttachmentOwnership(err error) bool {
 		return false
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "file ownership")
+}
+
+// maxImageRefs 限制错误诊断里列出的图片位置数量（对齐上游 v0.2.4 的做法）。
+const maxImageRefs = 16
+
+// withRetryHint 把上游建议的等待时间补进错误正文。CPA 的插件执行器 ABI 没有"错误响应头"
+// 通道（pluginapi.ExecutorResponse 只有 Payload/Headers，HTTP 状态码由 CPA 决定），
+// 所以 Retry-After 只能以文本形式交给客户端与日志。
+func withRetryHint(err error, headers http.Header) error {
+	wait := strings.TrimSpace(headers.Get("Retry-After"))
+	if wait == "" {
+		return err
+	}
+	var apiError *APIError
+	if !errors.As(err, &apiError) || apiError == nil || apiError.Status != http.StatusTooManyRequests {
+		return err
+	}
+	if seconds, convErr := strconv.Atoi(wait); convErr == nil && seconds > 0 {
+		wait = fmt.Sprintf("%ds", seconds)
+	}
+	clone := *apiError
+	clone.Message = fmt.Sprintf("%s; retry_after=%s", apiError.Message, wait)
+	return &clone
 }

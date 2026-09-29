@@ -46,7 +46,7 @@ func TestInlineImagePreflightRejectsBeforeAnyUpload(t *testing.T) {
 	oversized := paddedPNGDataURL(3, 2, maxInlineImageBytes)
 	seventeenMiB := paddedPNGDataURL(3, 2, 17<<20)
 	tooManyPixels := paddedPNGDataURL(100000, 1000, 0)
-	mediaTypeMismatch := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(headerOnlyPNG(3, 2))
+	// 声明值不再参与上传格式判定（字节签名说了算），所以这里只保留真正会被拒的用例。
 	undecodable := "data:image/png;base64," + base64.StdEncoding.EncodeToString([]byte("not an image"))
 	limitParts := make([]any, 0, defaultMaxRequestInlineImages+1)
 	for range defaultMaxRequestInlineImages + 1 {
@@ -60,7 +60,6 @@ func TestInlineImagePreflightRejectsBeforeAnyUpload(t *testing.T) {
 		{"single-image-size", []any{imagePart(oversized)}},
 		{"request-total-size", []any{imagePart(seventeenMiB), imagePart(seventeenMiB)}},
 		{"pixel-count", []any{imagePart(tooManyPixels)}},
-		{"media-type-mismatch", []any{imagePart(mediaTypeMismatch)}},
 		{"undecodable", []any{imagePart(undecodable)}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

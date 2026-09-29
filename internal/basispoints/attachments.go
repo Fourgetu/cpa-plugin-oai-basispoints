@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -119,7 +120,9 @@ func (c *attachmentCache) reset() {
 
 type inlineImage struct {
 	mediaType string
-	data      []byte
+	// filename 仅在需要上传时使用（空串 = 字节签名不在上传白名单内）。
+	filename string
+	data     []byte
 }
 
 func decodeInlineImage(dataURL string) (inlineImage, error) {
@@ -148,7 +151,12 @@ func decodeInlineImage(dataURL string) (inlineImage, error) {
 	if err != nil || len(data) == 0 {
 		return inlineImage{}, fail(400, "invalid_image", "input_image data URL contains empty or invalid image data")
 	}
-	return inlineImage{mediaType: mediaType, data: data}, nil
+	// 上传用的格式与文件名一律按字节签名判定；声明值只在签名不在白名单时保留（工具结果截图不走上传）。
+	detected, filename := uploadedImageFormat(data)
+	if detected == "" {
+		return inlineImage{mediaType: mediaType, data: data}, nil
+	}
+	return inlineImage{mediaType: detected, filename: filename, data: data}, nil
 }
 
 func attachmentURL(responsesURL string) (string, error) {
@@ -274,13 +282,13 @@ func (s *Service) uploadInputImages(request ExecutorRequest, body map[string]any
 			imageURL := stringValue(part["image_url"])
 			isData := len(imageURL) >= 5 && strings.EqualFold(imageURL[:5], "data:")
 			if imageCount >= imageLimit {
-				return fail(400, "invalid_image", fmt.Sprintf("a request may contain at most %d inline images", imageLimit))
+				return fail(400, "invalid_image", fmt.Sprintf("%s: a request may contain at most %d inline images", imagePosition(i, field, j), imageLimit))
 			}
 			if err := validateImageDetail(part["detail"]); err != nil {
-				return err
+				return withImagePosition(err, i, field, j)
 			}
 			if imageURL != "" && stringValue(part["file_id"]) != "" {
-				return fail(400, "invalid_image", "input_image cannot contain both image_url and file_id")
+				return fail(400, "invalid_image", imagePosition(i, field, j)+": input_image cannot contain both image_url and file_id")
 			}
 			if !isData {
 				imageCount++
@@ -289,7 +297,7 @@ func (s *Service) uploadInputImages(request ExecutorRequest, body map[string]any
 				// 用户/系统消息里的引用已在合法位置，保持原样。
 				if field == "output" {
 					if id := stringValue(part["file_id"]); id != "" && !validAttachmentID(id) {
-						return fail(400, "invalid_image", "input_image requires a valid file_id")
+						return fail(400, "invalid_image", imagePosition(i, field, j)+": input_image requires a valid file_id")
 					}
 					toolImageIndex[i]++
 					relocations = append(relocations, toolImageRelocation{
@@ -304,19 +312,23 @@ func (s *Service) uploadInputImages(request ExecutorRequest, body map[string]any
 			imageCount++
 			attachment, err := decodeInlineImage(imageURL)
 			if err != nil {
-				return err
+				return withImagePosition(err, i, field, j)
 			}
 			totalBytes += len(attachment.data)
 			if totalBytes > maxRequestInlineBytes {
-				return fail(400, "invalid_image", "inline images exceed the 32 MiB per-request limit")
+				return fail(400, "invalid_image", imagePosition(i, field, j)+": inline images exceed the 32 MiB per-request limit")
 			}
 			if err := validateInlineImage(attachment); err != nil {
-				return err
+				return withImagePosition(err, i, field, j)
 			}
 			// 工具结果里的内联截图是加载项的原生形态：保留 data: 原样、不上传——
 			// 上传成附件引用再放回 output 会被上游以 422 拒绝（实测确认）。
 			// 用户/系统消息与 agent_message 里的内联图片照常上传成附件引用。
 			if field == "content" {
+				// 上传只接受白名单内的字节签名：本地明确报错，不把问题留给上游 400。
+				if attachment.filename == "" {
+					return fail(400, "invalid_image", imagePosition(i, field, j)+": input_image bytes must identify a supported format: PNG, JPEG, GIF, or WebP")
+				}
 				pending = append(pending, pendingImageUpload{item: i, field: field, index: j, part: part, image: attachment})
 			}
 		}
@@ -401,10 +413,8 @@ func (s *Service) uploadInputImages(request ExecutorRequest, body map[string]any
 func (s *Service) uploadImage(request ExecutorRequest, endpoint string, attachment inlineImage, c credential) (string, error) {
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
-	filename := "image"
-	if extensions, _ := mime.ExtensionsByType(attachment.mediaType); len(extensions) > 0 {
-		filename += extensions[0]
-	}
+	// 文件名由字节签名决定（image.filename），不再依赖 mime.ExtensionsByType。
+	filename := attachment.filename
 	partHeaders := make(textproto.MIMEHeader)
 	partHeaders.Set("Content-Disposition", mime.FormatMediaType("form-data", map[string]string{"name": "file", "filename": filename}))
 	partHeaders.Set("Content-Type", attachment.mediaType)
@@ -438,7 +448,7 @@ func (s *Service) uploadImage(request ExecutorRequest, endpoint string, attachme
 				s.wait(delay)
 				continue
 			}
-			return "", fail(response.StatusCode, "attachment_upload_error", fmt.Sprintf("Basis Points attachment upload HTTP %d: %s", response.StatusCode, attachmentErrorMessage(response.Body, c, attachment)))
+			return "", withRetryHint(fail(response.StatusCode, "attachment_upload_error", fmt.Sprintf("Basis Points attachment upload HTTP %d: %s", response.StatusCode, attachmentErrorMessage(response.Body, c, attachment))), response.Headers)
 		}
 		var result struct {
 			FileID string `json:"openai_file_id"`
@@ -477,4 +487,45 @@ func validAttachmentID(id string) bool {
 		}
 	}
 	return true
+}
+
+// uploadedImageFormats 是 Basis Points 上传接口接受的图片后缀白名单。
+var uploadedImageFormats = map[string]string{
+	"image/png":  ".png",
+	"image/jpeg": ".jpeg",
+	"image/gif":  ".gif",
+	"image/webp": ".webp",
+}
+
+// uploadedImageFormat 按字节签名判定上传用的 Content-Type 与文件名：既不能用声明的 MIME
+// （可能是 image/jpg 这类别名 → ExtensionsByType 返回空 → 无后缀），也不能用运行环境的
+// 扩展名数据库（带 /etc/mime.types 的系统会把 image/jpeg 排成 .jfif）。上游按后缀白名单
+// 校验，名字写错整条请求都 400（见上游 v0.2.4 issue #15 的真实报错）。
+// 返回空串表示字节签名不在白名单内。
+func uploadedImageFormat(data []byte) (string, string) {
+	mediaType := http.DetectContentType(data)
+	if !strings.HasPrefix(mediaType, "image/") && bytes.HasPrefix(data, []byte("RIFF")) && len(data) >= 12 && string(data[8:12]) == "WEBP" {
+		mediaType = "image/webp"
+	}
+	extension, ok := uploadedImageFormats[mediaType]
+	if !ok {
+		return "", ""
+	}
+	return mediaType, "image" + extension
+}
+
+// imagePosition 给出"哪一条、哪个数组、第几个部件"的定位，便于把本地 400 与上游 400/422 对账。
+func imagePosition(item int, field string, index int) string {
+	return fmt.Sprintf("input[%d].%s[%d]", item, field, index)
+}
+
+// withImagePosition 保留原错误的状态码与类别，只在正文前补上定位。
+func withImagePosition(err error, item int, field string, index int) error {
+	var apiError *APIError
+	if !errors.As(err, &apiError) || apiError == nil {
+		return err
+	}
+	clone := *apiError
+	clone.Message = imagePosition(item, field, index) + ": " + apiError.Message
+	return &clone
 }

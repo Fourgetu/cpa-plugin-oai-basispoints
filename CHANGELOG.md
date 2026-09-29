@@ -1,5 +1,14 @@
 # 更新日志
 
+## v0.2.2-pro.5 — 2026-09-28（fork，未发布）
+
+搬运上游 v0.2.4 与 sub2api v2.8.20 的三处修复（都只影响图片与诊断，不改交付语义）：
+
+- **上传文件名/格式按字节签名判定**（对齐上游 v0.2.4 issue #15）：新增 `uploadedImageFormat`（`http.DetectContentType` + PNG/JPEG/GIF/WebP 后缀白名单，附 RIFF/WEBP 兜底），`decodeInlineImage` 用签名结果覆盖声明 MIME，`uploadImage` 直接用 `image.filename`。此前用 `mime.ExtensionsByType(mediaType)[0]`：声明 `image/jpg` → 空 → 文件名无后缀；在带 `/etc/mime.types` 的环境里 `image/jpeg` → `.jfif` —— 两者都不在上游白名单（`.jpeg/.jpg/.png/.gif/.webp`）里，会让整条请求 400 `Invalid input: Expected image type to be a supported format`。实测我方运行环境返回 `[.jfif .jpe .jpeg .jpg .pjp .pjpeg]`，CPA 容器内无 mime.types 才侥幸取到 `.jpeg`。上传路径遇到白名单外字节签名现在本地 400，不留问题给上游。
+- **图片诊断**（对齐上游 v0.2.4）：本地图片类错误带位置 `input[i].content[j]` / `input[i].output[j]`（`imagePosition`/`withImagePosition`）；上游错误追加 `image_refs`（最多 16 条 `位置:类型`，类型为 `data_url`/`image_url`/`file_id`/`missing`，超出的记 `,...(N more)`），不输出 URL、file_id 或图片内容。
+- **429 的 `Retry-After` 提示**（对齐 sub2api v2.8.20 的处理意图）：`withRetryHint` 在上游 429 最终失败时把可解析的 `Retry-After` 以 `retry_after=Ns` 附到错误正文（上游调用/流式调用/附件上传三处）。**CPA 7.3.17 的插件执行器 ABI 没有错误响应头通道**（`pluginapi.ExecutorResponse` 只有 Payload/Headers，HTTP 状态码由 CPA 决定，响应拦截器只在成功路径被调用且固定传 `StatusOK`），所以无法真正下发响应头——这条只在文本与日志层面生效。
+- 测试：新增 `upload_format_test.go`（字节签名决定文件名/Content-Type 5 例、白名单外字节本地 400 带位置、`image_refs` 诊断与不泄漏断言、429 带 `retry_after` 提示）；`attachments_limits_test.go` 去掉"声明与字节不符即拒"的用例（按字节为准后该情形会被正常上传）。
+
 ## v0.2.2-pro.4 — 2026-09-28（fork，未发布）
 
 **限速 / 上游 5xx 的鲁棒性**（对应 2026-09-28 线上三类事故：附件上传 429、账号级"1000 次/分钟"429、上游 500 → CPA 冷却 → 503 墙）：

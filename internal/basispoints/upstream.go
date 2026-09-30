@@ -359,7 +359,20 @@ func upstreamRequestError(status int, raw []byte, body map[string]any, c credent
 			imageSummary += fmt.Sprintf(",...(%d more)", images-len(imageRefs))
 		}
 	}
-	return fail(status, "upstream_error", fmt.Sprintf("Basis Points HTTP %d: %s (reasoning_effort=%s; service_tier=%s; input_images=%d; original_detail_images=%d%s)", status, message, stringValue(body["reasoning_effort"]), tier, images, originalDetails, imageSummary))
+
+	// 上游错误标识符（code/type）一并带进文案：分类判定不能只靠英文措辞，同一条语义可能只有 code
+	// （对齐上游 v0.2.7 与 sub2api v2.9.5 的"按标识符分类"）。只取标识符，不取正文。
+	upstreamDiagnostic := ""
+	if parsed, reason := parseRelayObject(string(raw)); reason == "" {
+		if detail := objectValue(parsed["error"]); detail != nil {
+			code := strings.TrimSpace(stringValue(detail["code"]))
+			kind := strings.TrimSpace(stringValue(detail["type"]))
+			if code != "" || kind != "" {
+				upstreamDiagnostic = fmt.Sprintf("; upstream_code=%s; upstream_type=%s", code, kind)
+			}
+		}
+	}
+	return fail(status, "upstream_error", fmt.Sprintf("Basis Points HTTP %d: %s (reasoning_effort=%s; service_tier=%s; input_images=%d; original_detail_images=%d%s%s)", status, message, stringValue(body["reasoning_effort"]), tier, images, originalDetails, imageSummary, upstreamDiagnostic))
 }
 
 // isEncryptedContentRejection 只认"明确说密文验不过"的 400：

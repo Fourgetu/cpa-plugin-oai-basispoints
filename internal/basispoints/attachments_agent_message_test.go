@@ -29,8 +29,8 @@ func TestAgentMessageInlineImagesAreUploaded(t *testing.T) {
 	items := source["input"].([]any)
 	agentParts := objectValue(items[0])["content"].([]any)
 	part := objectValue(agentParts[1])
-	if part["file_id"] != "file-agent-message" || part["image_url"] != nil || part["detail"] != "high" {
-		t.Fatalf("agent_message image not rewritten: %#v", part)
+	if part["file_id"] != "file-agent-message" || part["image_url"] != nil || part["detail"] != nil || len(part) != 2 {
+		t.Fatalf("agent_message image not rewritten to type+file_id: %#v", part)
 	}
 	if text := objectValue(agentParts[0]); text["text"] != "screenshot from the helper" {
 		t.Fatalf("agent_message text changed: %#v", text)

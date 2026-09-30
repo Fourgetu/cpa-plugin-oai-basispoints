@@ -1,5 +1,17 @@
 # 更新日志
 
+## v0.2.2-pro.7 — 2026-09-30（fork，未发布）
+
+**第一批搬运：上游 v0.2.6–v0.2.9 与 sub2api v2.9.5 里与我们相关的五项**（评估见 `BORROW-eval-20260930-upstream-v0.2.6-v0.2.9.md`）：
+
+- **工具示例改为按本轮目录生成**（对齐上游 v0.2.8 与 sub2api v2.9.5 的**独立同修**）：新增 `clientToolRelayExamples`，只为目录内、类型匹配、且示例参数能过声明 schema 的工具生成示例（函数给 JSON 参数对象、custom 给原始文本、用完整限定名）；不再把 `exec_command`（函数）与 `apply_patch`（custom 裸文本）写死进所有请求——目录里没有它们、或 `apply_patch` 被声明成函数时，旧提示词会把模型教错名字/错形状（`tool_not_in_catalog` 422 或参数 schema 不符）。同时把"函数工具两层 JSON"抽成常量 `functionRelayEncoding`，在协议说明、纠错提示 `transportRetryHint`、每轮提醒三处共用同一措辞。
+- **`response.cancelled` 纳入增量桥终态**（对齐 sub2api v2.9.5）：此前只认 `completed`/`incomplete`/`failed`/`error`，上游以 `cancelled` 收尾时事件被当普通事件透传、流在没有终态的情况下结束。现在按终态收尾并摘掉半截工具条目（严格路径 `parseFinalStreamResponse` 早已处理它）。
+- **上游失败分类纳入标识符**（对齐上游 v0.2.7 与 sub2api v2.9.5）：`upstreamRequestError` 把上游 `code`/`type` 以 `upstream_code=`/`upstream_type=` 附进我们自己的错误文案；`isModelAccessDenial` 除原有英文措辞外也认这些标识符；`asUpstreamModelAccessError` 从"仅 404"扩到 **403 模型访问/权限/配额类**，**401 刻意不内联**（那是真凭据问题，该让 CPA 与运维看见）。
+- **传输层失败按内联交付**（对齐上游 v0.2.9 `transportError` 的意图）：`upstream_transport` / `attachment_transport`（502）纳入 `asUpstreamServerError`——传输问题不是凭据故障，交给 CPA 只会把可恢复的抖动放大成整个别名的 503 墙；`invalid_upstream_response` 等仍保持响亮。
+- **合成流补 `reasoning` 条目摘要事件**（对齐上游 v0.2.6）：新增 `emitReasoningSummary`，`syntheticStream` 为 reasoning 条目发 `reasoning_summary_part/text` 四个事件、并在 `output_item.added` 里补空 `summary`；此前"缓冲后回放成 SSE"的路径上，客户端"思考"面板会空白。
+- **附件引用只发最小形状 `{type, file_id}`**（采纳上游 v0.2.4 #17；翻案依据是 sub2api v2.9.5 独立同向的 `normalizeMessageFileImages`）：新增 `normalizeFileReferenceImages`，在图片校验与上传**之后**把 message 正文里的 `input_image` 引用收敛成恰好 `type`+`file_id`——不再补齐或保留 `detail`/`client_metadata` 等字段；上传回填也改成只写这两个字段（此前缺 `detail` 还会补 `"auto"`）。内联 `data:`（含工具结果截图）与 HTTPS `image_url` 仍保留并校验 `detail`。**边界**：归一在校验之后，非法 `detail`、`file_id` 与 `image_url` 混用仍本地 400；工具结果条目（上游以 422 拒绝其中的附件引用，另有搬迁逻辑）不参与归一。
+- 测试：新增 `tool_examples_test.go`（目录外不教、类型匹配、函数形态 patch、限定名、schema 不符则跳过、三处措辞一致）、`stream_terminal_test.go`（cancelled 终态、合成流摘要事件、空摘要只发生生命周期）、**`file_reference_shape_test.go`**（最小形状矩阵：`detail` 取 5 种值 × `message`/`agent_message`/仅带 `role` 三形态；工具结果与 HTTPS 引用不受影响；混用引用与非法 `detail` 在校验阶段被拒且输入不被改写）；`model_access_test.go` 增补标识符分类、403/401 边界、错误文案带标识符、传输类内联（含端到端流式用例）；并按新契约更新 `attachments_test.go`、`attachments_agent_message_test.go`、`attachments_http_test.go`、`attachments_limits_test.go`、`tool_images_test.go` 里"上传后仍保留 `detail`、缺失补 `auto`"的旧断言。
+
 ## v0.2.2-pro.6 — 2026-09-30（fork，未发布）
 
 **上游 404"模型不可用"不再让 CPA 冷却唯一凭据**（对应 2026-09-30 线上事故：`gpt-6-astra-basispoints` 被上游持续 404，CPA 冷却后整个别名 503 `auth_unavailable`，实测 10 分钟不自愈，只能重启）：

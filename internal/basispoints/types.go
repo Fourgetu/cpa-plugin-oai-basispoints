@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	Version        = "0.2.2-pro.6"
+	Version        = "0.2.2-pro.7"
 	Provider       = "oai-basispoints"
 	AuthProviderID = "codex"
 	PluginID       = Provider
@@ -48,28 +48,34 @@ func asProtocolError(err error) (*APIError, bool) {
 	return nil, false
 }
 
-// asUpstreamServerError 判断错误是不是上游 5xx。单凭据插件里把 5xx 交给 CPA 会把账号冷却、
-// 整个模型变成 503 墙（同一账号的其它客户端一起断），所以这类错误在服务层按内联失败交付。
+// asUpstreamServerError 判断错误是不是上游 5xx（含传输层失败）。单凭据插件里把这些交给 CPA 会把账号
+// 冷却、整个模型变成 503 墙（同一账号的其它客户端一起断），所以这类错误在服务层按内联失败交付。
+// `upstream_transport` / `attachment_transport` 是 host.http.do 一层的失败（2026-09-30 补）：传输问题
+// 同样不是凭据故障，冷却唯一凭据只会把可恢复的抖动放大成整个别名的 503。
 func asUpstreamServerError(err error) (*APIError, bool) {
 	var apiError *APIError
 	if !errors.As(err, &apiError) || apiError == nil || apiError.Status < 500 || apiError.Status > 599 {
 		return nil, false
 	}
 	switch apiError.Kind {
-	case "upstream_error", "attachment_upload_error":
+	case "upstream_error", "attachment_upload_error", "upstream_transport", "attachment_transport":
 		return apiError, true
 	}
 	return nil, false
 }
 
-// asUpstreamModelAccessError 判断错误是不是"上游拒绝该模型/账号"的 404。
-// 2026-09-30 实测：上游对某个模型回 404（`The model \`…\` does not exist or you do not have access to it.`，
-// 其内部还会把模型名贴上 `degrade2-luna` / `codex-abuse` 一类标签），CPA 收到后会把这套（单凭据插件的
-// 唯一）凭据冷却成持续的 503 `auth_unavailable`，且不会自愈——只能重启 CPA。这类错误重试与冷却都无意义，
-// 因此与上游 5xx 同样在服务层按内联失败交付：客户端立刻拿到明确终态，其它模型/请求不受影响。
+// asUpstreamModelAccessError 判断错误是不是"上游拒绝该模型/账号"（404 模型不存在/无访问权，或
+// 403 模型访问变更、权限、配额类）。2026-09-30 实测：上游对某个模型回 404（`The model \`…\` does not
+// exist or you do not have access to it.`，其内部还会把模型名贴上 `degrade2-luna` / `codex-abuse` 一类
+// 标签），CPA 收到后会把这套（单凭据插件的唯一）凭据冷却成持续的 503 `auth_unavailable`、且不会自愈
+// ——只能重启 CPA。这类错误重试与冷却都无意义，因此与上游 5xx 同样按内联失败交付。
+// **401（凭据过期/无效）刻意不在此列**：那确实是凭据问题，该让 CPA 与运维看见。
 func asUpstreamModelAccessError(err error) (*APIError, bool) {
 	var apiError *APIError
-	if !errors.As(err, &apiError) || apiError == nil || apiError.Status != 404 {
+	if !errors.As(err, &apiError) || apiError == nil {
+		return nil, false
+	}
+	if apiError.Status != 404 && apiError.Status != 403 {
 		return nil, false
 	}
 	switch apiError.Kind {
@@ -83,14 +89,23 @@ func asUpstreamModelAccessError(err error) (*APIError, bool) {
 	return apiError, true
 }
 
-// isModelAccessDenial 识别上游"模型不存在 / 无访问权 / 模型访问已变更"的文案。
-// 只认这几条：其它 404（例如 responses_url 配错、路径写错）仍原样交给 CPA，保持配置错误足够响亮。
+// isModelAccessDenial 识别上游"模型不存在 / 无访问权 / 模型访问已变更"的文案或标识符。
+// 文案之外也认 `upstream_code=` / `upstream_type=` 里的已知标识（上游 v0.2.7 与 sub2api v2.9.5 也是按
+// 标识符分类），因为同一条语义可能只有 code、没有那段英文。其它 4xx（responses_url 配错、内容策略拒绝
+// 等）仍原样交给 CPA，保持配置错误足够响亮。
 func isModelAccessDenial(message string) bool {
 	lowered := strings.ToLower(message)
 	for _, marker := range []string{
 		"does not exist or you do not have access",
 		"model_not_found",
 		"model access has changed",
+		"basispoints_model_access_changed",
+		"upstream_code=permission_error",
+		"upstream_code=permission_denied",
+		"upstream_code=insufficient_quota",
+		"upstream_code=usage_limit_reached",
+		"upstream_type=permission_error",
+		"upstream_type=permission_denied",
 	} {
 		if strings.Contains(lowered, marker) {
 			return true

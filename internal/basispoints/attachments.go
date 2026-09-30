@@ -183,7 +183,7 @@ func inlineImageField(item map[string]any) string {
 	}
 }
 
-// validateImageDetail 只接受官方 detail 枚举；缺失时由上传逻辑补 "auto"。
+// validateImageDetail 只接受官方 detail 枚举。附件引用不再补 detail：file_id 只发 {type, file_id}。
 func validateImageDetail(value any) error {
 	if value == nil {
 		return nil
@@ -248,6 +248,7 @@ type toolImageRelocation struct {
 // 用户/系统消息与 agent_message 里的内联图片上传成附件引用；工具结果里的内联截图
 // 保留 data: 原样（加载项原生形态，上传转附件引用反而会被上游以 422 拒绝）；
 // 工具结果里的附件引用（file_id/HTTPS）搬进紧随其后的 user 消息。
+// 收尾统一把 message 正文里的附件引用收敛成 {type, file_id}（normalizeFileReferenceImages）。
 func (s *Service) uploadInputImages(request ExecutorRequest, body map[string]any, c credential, cfg Config) error {
 	items, _ := body["input"].([]any)
 	var pending []pendingImageUpload
@@ -333,9 +334,6 @@ func (s *Service) uploadInputImages(request ExecutorRequest, body map[string]any
 			}
 		}
 	}
-	if len(pending) == 0 && len(relocations) == 0 {
-		return nil
-	}
 	if len(pending) > 0 {
 		endpoint, err := attachmentURL(cfg.ResponsesURL)
 		if err != nil {
@@ -362,13 +360,9 @@ func (s *Service) uploadInputImages(request ExecutorRequest, body map[string]any
 				updated[upload.item] = append([]any(nil), original...)
 				fields[upload.item] = upload.field
 			}
-			part := cloneObject(upload.part)
-			delete(part, "image_url")
-			part["file_id"] = fileID
-			if _, exists := part["detail"]; !exists {
-				part["detail"] = "auto"
-			}
-			updated[upload.item][upload.index] = part
+			// 附件引用只发最小形状：不补 detail、也不保留原部件的其它字段
+			// （回放的历史引用由收尾的 normalizeFileReferenceImages 做同样处理）。
+			updated[upload.item][upload.index] = map[string]any{"type": "input_image", "file_id": fileID}
 		}
 		for index, parts := range updated {
 			item := cloneObject(objectValue(items[index]))
@@ -376,11 +370,17 @@ func (s *Service) uploadInputImages(request ExecutorRequest, body map[string]any
 			items[index] = item
 		}
 	}
-	if len(relocations) == 0 {
-		return nil
+	if len(relocations) > 0 {
+		body["input"] = relocateToolImageReferences(items, relocations)
 	}
-	// 把工具结果里的附件引用搬进紧随其后的 user 消息：原位换成标签文本，
-	// 图片按 [标签, 图片] 交替放进新消息，保持文字、顺序与 call 关联。
+	// 收尾统一形状：message 正文里的附件引用只发 {type, file_id}。
+	normalizeFileReferenceImages(body)
+	return nil
+}
+
+// relocateToolImageReferences 把工具结果里的附件引用（file_id/HTTPS）搬进紧随其后的 user 消息：
+// 原位换成标签文本，图片按 [标签, 图片] 交替放进新消息，保持文字、顺序与 call 关联。
+func relocateToolImageReferences(items []any, relocations []toolImageRelocation) []any {
 	byItem := map[int][]toolImageRelocation{}
 	for _, relocation := range relocations {
 		byItem[relocation.item] = append(byItem[relocation.item], relocation)
@@ -406,8 +406,47 @@ func (s *Service) uploadInputImages(request ExecutorRequest, body map[string]any
 			next = append(next, insertion)
 		}
 	}
-	body["input"] = next
-	return nil
+	return next
+}
+
+// normalizeFileReferenceImages 把 message 正文里的附件引用收敛成上游要求的**最小形状**
+// {type, file_id}：不补齐也不保留 detail 等额外字段。
+//
+// 依据：上游 v0.2.4 #17（v0.2.5 CHANGELOG：「新上传和已有 file_id 均只向 Basis Points 发送
+// type、file_id」）与 sub2api v2.9.5 的 normalizeMessageFileImages——两侧独立同向。内联
+// data:（含工具结果里的截图）与 HTTPS image_url 保持原样，它们的 detail 由本地校验与上游
+// 决定；工具结果条目本身不在此列（上游以 422 拒绝那里的附件引用，见 uploadInputImages）。
+//
+// 必须在图片校验与上传之后调用：先校验、后归一，畸形引用（非法 file_id、file_id 与
+// image_url 混用、非法 detail）仍要在本地报错，不能被归一掩盖。判定与 sub2api 一致，
+// 另覆盖 agent_message（我们的历史翻译会把它降级成 message，这里再兜一层）。
+func normalizeFileReferenceImages(body map[string]any) {
+	items, _ := body["input"].([]any)
+	for _, value := range items {
+		item := objectValue(value)
+		if item == nil {
+			continue
+		}
+		kind := stringValue(item["type"])
+		if kind != "message" && kind != "agent_message" && (kind != "" || stringValue(item["role"]) == "") {
+			continue
+		}
+		parts, ok := item["content"].([]any)
+		if !ok {
+			continue
+		}
+		for index, value := range parts {
+			part := objectValue(value)
+			if part == nil || stringValue(part["type"]) != "input_image" {
+				continue
+			}
+			fileID := stringValue(part["file_id"])
+			if fileID == "" {
+				continue
+			}
+			parts[index] = map[string]any{"type": "input_image", "file_id": fileID}
+		}
+	}
 }
 
 func (s *Service) uploadImage(request ExecutorRequest, endpoint string, attachment inlineImage, c credential) (string, error) {

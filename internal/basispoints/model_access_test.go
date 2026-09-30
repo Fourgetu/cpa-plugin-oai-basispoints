@@ -198,3 +198,130 @@ func TestUnexpectedNotFoundStillSurfaces(t *testing.T) {
 		t.Fatalf("err = %v, want a 404 APIError", err)
 	}
 }
+
+// ③ 标识符参与分类：同一条语义可能只有 code/type，没有那段英文。
+func TestModelAccessDenialRecognizesIdentifiers(t *testing.T) {
+	matches := []string{
+		"Basis Points HTTP 403: Model access has changed. Available models will update automatically. (reasoning_effort=medium; service_tier=unspecified; input_images=0; original_detail_images=0; upstream_code=insufficient_quota; upstream_type=permission_error)",
+		"Basis Points HTTP 404: not found (upstream_code=model_not_found)",
+		"Basis Points HTTP 403: refused (upstream_code=permission_denied)",
+		"Basis Points HTTP 403: refused (upstream_type=permission_denied)",
+		"Basis Points HTTP 403: refused (upstream_code=basispoints_model_access_changed)",
+	}
+	for _, message := range matches {
+		if !isModelAccessDenial(message) {
+			t.Errorf("identifier was not recognised: %q", message)
+		}
+	}
+	for _, message := range []string{
+		"Basis Points HTTP 400: bad arguments (upstream_code=invalid_request)",
+		"Basis Points HTTP 429: slow down (upstream_code=rate_limit_exceeded)",
+		"Basis Points HTTP 404: path not found",
+	} {
+		if isModelAccessDenial(message) {
+			t.Errorf("unrelated identifier was treated as a model-access denial: %q", message)
+		}
+	}
+}
+
+// ③ 403 模型访问类也内联交付；401（凭据问题）刻意不内联，保持响亮。
+func TestUpstreamModelAccessErrorHandlesForbiddenButNotUnauthorized(t *testing.T) {
+	forbidden := &APIError{Status: 403, Kind: "upstream_error",
+		Message: "Basis Points HTTP 403: Model access has changed (upstream_code=insufficient_quota; upstream_type=permission_error)"}
+	if _, ok := asUpstreamModelAccessError(forbidden); !ok {
+		t.Fatal("403 model-access denial should be delivered inline")
+	}
+	expired := &APIError{Status: 401, Kind: "upstream_error",
+		Message: "Basis Points HTTP 401: token expired (upstream_code=token_expired)"}
+	if _, ok := asUpstreamModelAccessError(expired); ok {
+		t.Fatal("401 must stay visible to CPA: it is a real credential problem")
+	}
+	policy := &APIError{Status: 403, Kind: "upstream_error",
+		Message: "Basis Points HTTP 403: policy refusal (upstream_code=content_policy_violation)"}
+	if _, ok := asUpstreamModelAccessError(policy); ok {
+		t.Fatal("an unrelated 403 must not be treated as a model-access denial")
+	}
+}
+
+// ③ 上游错误标识符要出现在我们自己的错误文案里（否则分类看不到 code/type）。
+func TestUpstreamRequestErrorCarriesIdentifiers(t *testing.T) {
+	raw := jsonBytes(map[string]any{"error": map[string]any{
+		"message": "Model access has changed. Available models will update automatically.",
+		"code":    "insufficient_quota",
+		"type":    "permission_error",
+	}})
+	err := upstreamRequestError(403, raw, map[string]any{"model": DefaultModelID}, credential{})
+	var apiError *APIError
+	if !errors.As(err, &apiError) || apiError.Status != 403 {
+		t.Fatalf("err = %v, want a 403 APIError", err)
+	}
+	for _, want := range []string{"upstream_code=insufficient_quota", "upstream_type=permission_error", "Model access has changed"} {
+		if !strings.Contains(apiError.Message, want) {
+			t.Fatalf("message %q is missing %q", apiError.Message, want)
+		}
+	}
+}
+
+// ⑬ 传输层失败（502）与上游 5xx 一样内联交付：交给 CPA 只会冷却唯一凭据。
+func TestTransportFailuresAreDeliveredInline(t *testing.T) {
+	for _, kind := range []string{"upstream_transport", "attachment_transport"} {
+		if _, ok := asUpstreamServerError(&APIError{Status: 502, Kind: kind, Message: "transport failed"}); !ok {
+			t.Fatalf("%s must be delivered inline", kind)
+		}
+	}
+	if _, ok := asUpstreamServerError(&APIError{Status: 502, Kind: "invalid_upstream_response", Message: "boom"}); ok {
+		t.Fatal("unparseable-body errors stay loud (not part of this batch)")
+	}
+}
+
+// ⑬ 端到端：host.http.do_stream 失败时，客户端拿到内联失败终态而不是插件错误。
+func TestStreamTransportFailureIsDeliveredInline(t *testing.T) {
+	service := NewService()
+	closed := make(chan string, 4)
+	var mu sync.Mutex
+	var emitted []string
+	service.SetHost(func(method string, payload any, out any) error {
+		switch method {
+		case "host.http.do_stream":
+			return errors.New("dial tcp: connection refused")
+		case "host.stream.emit":
+			mu.Lock()
+			emitted = append(emitted, string(payload.(map[string]any)["payload"].([]byte)))
+			mu.Unlock()
+			return nil
+		case "host.stream.close":
+			raw, _ := json.Marshal(payload)
+			var request struct {
+				Error string `json:"error"`
+			}
+			_ = json.Unmarshal(raw, &request)
+			select {
+			case closed <- request.Error:
+			default:
+			}
+			return nil
+		}
+		return fmt.Errorf("unexpected host method %s", method)
+	})
+	result, err := service.Handle("executor.execute_stream", jsonBytes(streamRequest(namespaceTestSource("function", "get_weather", ""))))
+	if err != nil {
+		t.Fatalf("a transport failure must not be reported as a plugin error (CPA would cool the account): %v", err)
+	}
+	if result == nil {
+		t.Fatal("no stream headers were returned")
+	}
+	select {
+	case closeErr := <-closed:
+		if closeErr != "" {
+			t.Fatalf("stream closed with an error: %q", closeErr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("stream was not closed")
+	}
+	mu.Lock()
+	joined := strings.Join(emitted, "")
+	mu.Unlock()
+	if !strings.Contains(joined, "response.failed") || !strings.Contains(joined, "upstream_server_error") {
+		t.Fatalf("inline failure was not emitted: %q", joined)
+	}
+}

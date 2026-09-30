@@ -48,6 +48,8 @@ plugins:
 | 16 | 限速与上游 5xx 的鲁棒性：429/503/500/502/504 有界退避重试（读 `Retry-After`，上限 8s）；上游 5xx 改按内联失败交付（`response.failed` / `status=failed`，HTTP 200）不再让 CPA 冷却唯一凭据；附件缓存去掉 `access_token` 键、加 15 分钟有效期、容量可配（`max_attachment_cache_entries`） | 2026-09-28 实测：附件上传 429 会把客户端拖进"整轮重试→重传所有图片"；账号级 1000 次/分钟 429 与我们无关（我们只有 1–3 请求/分钟，同账号网页端在共用配额）；上游 500（复用过期 `file_id`）会以 5xx 交给 CPA → 凭据冷却 → 连打 9 次 503 |
 | 17 | 图片上传按**字节签名**定文件名与 Content-Type（PNG/JPEG/GIF/WebP 白名单，删掉 `mime.ExtensionsByType`）；图片类错误带位置，上游图片错误追加 `image_refs`（只给位置与类型）；429 最终失败时把 `Retry-After` 以 `retry_after=Ns` 附到错误正文 | 旧实现取 `ExtensionsByType(mediaType)[0]`：`image/jpeg` → `.jfif`（有 `/etc/mime.types` 的环境）、`image/jpg` → 空后缀，两者都不在上游白名单（`.jpeg .jpg .png .gif .webp`）里，会让整条请求被 400 `Invalid input: Expected image type to be a supported format`；CPA 容器里没有 mime.types 才一直侥幸取到 `.jpeg` |
 | 18 | 上游 404"模型不存在/无访问权"按内联失败交付（错误码 `upstream_model_unavailable`），不再让 CPA 冷却唯一凭据 | 2026-09-30 实测：上游对某个模型持续 404（错误里模型名被上游贴上 `degrade2-luna` / `codex-abuse` 一类标签），CPA 冷却后该别名每次立即 503 `auth_unavailable` 且 10 分钟不自愈、只能重启 CPA，同账号其它客户端一起断；与模型访问无关的 404 仍照旧上抛，配置错误不会被静默 |
+| 19 | 五项搬运（对齐上游 v0.2.6–v0.2.9 与 sub2api v2.9.5）：① 中继示例按本轮目录生成（不再写死 `exec_command`/`apply_patch`），两层 JSON 说明三处共用；② `response.cancelled` 纳入增量桥终态；③ 失败分类纳入 `code`/`type` 标识符，403 模型访问/权限/配额类也内联（**401 不内联**）；④ 传输层 502（`upstream_transport`/`attachment_transport`）按内联交付；⑤ 合成流补 `reasoning` 条目摘要事件 | ① 旧提示词会把目录外或类型不符的工具教给模型（上游 v0.2.8 与 sub2api v2.9.5 **各自独立**修此处）；② 缺它则上游以 `cancelled` 收尾时流在没有终态的情况下结束；③ 同一条访问语义可能只有 `code` 没有那段英文；④ 传输抖动交给 CPA 会冷却唯一凭据、放大成整别名 503；⑤ 缓冲回放路径上客户端"思考"面板会空白 |
+| 20 | 附件引用只发**最小形状** `{type, file_id}`：message 正文里的图片引用在上传/回放后不再携带 `detail`、`client_metadata` 等字段（上传回填也不再补 `detail: "auto"`）；内联 `data:`（含工具结果截图）与 HTTPS `image_url` 仍保留并校验 `detail` | 上游 v0.2.4 #17 与 sub2api v2.9.5 的 `normalizeMessageFileImages` **两侧独立同向**（后者把这条写成契约）；当初"不采纳"的反证只是"那次请求回的是 500 归属校验而不是 422"，并不能证明 `detail` 被接受，而那次事故的请求形状（12 张图里有 2 张被换成带 `detail` 的引用）恰好落在要归一的形状里 |
 
 此外还有两处收紧，属于本分支对放行策略的加固：
 
@@ -87,6 +89,7 @@ make build
 - 未能从 OAuth JWT 或凭据字段得到账号 ID、token 过期、上游返回非 2xx、工具名不在客户端目录中时，插件会报告明确错误，不伪造成功。
 - 内联图片预检：张数上限由插件配置 `max_request_inline_images` 控制（默认 512，范围 1–4096）；单图解码后 ≤20 MiB、整请求累计 ≤32 MiB、解码后 ≤64 MP 三道闸门固定。工具结果里的 `data:` 截图保留原样不改写，其中的 `file_id`/HTTPS 引用搬进紧随该结果的 user 消息。
 - 图片上传的文件名与 `Content-Type` 按**字节签名**判定（`http.DetectContentType` + PNG/JPEG/GIF/WebP 白名单，WebP 另有 RIFF 兜底），不再用声明 MIME 推断后缀；字节签名不在白名单内的图片在本地即 400，不发给上游。图片类错误带位置（`input[i].content[j]` / `input[i].output[j]`），上游图片错误附 `image_refs`（最多 16 条位置与类型，不含 URL、file_id 或图片内容）；上游 429 最终失败时错误正文附 `retry_after=Ns`（CPA 7.3.17 的插件执行器 ABI 没有错误响应头通道，这条只在文本与日志层生效）。
+- 附件引用（`file_id`）只发**最小形状** `{type, file_id}`：message 正文里的引用在上传与回放后都不再携带 `detail` 等字段（`normalizeFileReferenceImages`，在图片校验与上传**之后**执行，畸形引用仍本地 400）；HTTPS `image_url` 与工具结果里的内联截图保留自己的 `detail`。
 
 ---
 

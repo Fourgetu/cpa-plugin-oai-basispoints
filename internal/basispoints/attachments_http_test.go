@@ -49,8 +49,8 @@ func TestExecuteImageThroughLocalHTTP(t *testing.T) {
 				return
 			}
 			part := objectValue(lastUserContent(body)[0])
-			if part["file_id"] != "file-http-test" || part["image_url"] != nil || part["detail"] != "high" {
-				t.Error("HTTP response request lost the attachment reference or detail")
+			if part["file_id"] != "file-http-test" || part["image_url"] != nil || part["detail"] != nil || len(part) != 2 {
+				t.Error("HTTP response request did not carry the minimal attachment reference")
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": "resp-local-test", "status": "completed", "output": []any{map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "local protocol fixture"}}}}})
 		default:

@@ -249,7 +249,7 @@ docker run --rm -v "$PWD":/src -w /src golang:1.26 sh -c '
 
 **刻意没做**：
 
-- 上游 v0.2.4 同批的 **#17「回填不带 `detail`」不采纳**：我们有反证——2026-09-28 14:00 的请求 dump 里带 `detail:"high"` 的 `file_id` 请求，上游回的是 500 归属校验失败而不是 422（即 `detail` 不是这批 400/422 的成因），且 `detail: original` 对截图保真有用。上游那一项只用本地夹具验证、未做远端对照。
+- 上游 v0.2.4 同批的 **#17「回填不带 `detail`」当时不采纳**（**已在 0.2.2-pro.7 翻案并采纳，见第 19 节第 6 条**）：当时的反证是 2026-09-28 14:00 的请求 dump 里带 `detail:"high"` 的 `file_id` 请求，上游回的是 500 归属校验失败而不是 422（即 `detail` 不是那批 400/422 的成因），且 `detail: original` 对截图保真有用；上游那一项只用本地夹具验证、未做远端对照。后来 sub2api v2.9.5 独立同向的实现推翻了这一判断。
 - sub2api v2.8.20 的"BPS 429 专项账号调度"与 v2.9.x 的图片策略（off/warning/auto_compact，需要 Redis + checkpoint + 客户端回显）架构不匹配（我们是单凭据 CPA 插件、没有账号池与暂存图床），不搬。
 
 **测试**：新增 `upload_format_test.go`（字节签名决定文件名与 Content-Type 5 例含"声明 WebP 但无编码器"、白名单外字节本地 400 且带位置、`image_refs` 诊断与不泄漏断言、429 带 `retry_after=Ns`）；`attachments_limits_test.go` 去掉"声明与字节不符即拒"的用例（按字节为准后该情形会被正常上传）。
@@ -284,3 +284,19 @@ docker run --rm -v "$PWD":/src -w /src golang:1.26 sh -c '
 - 为什么不是"一律内联所有 4xx"：与模型访问无关的 404（`responses_url` 配错、路径写错等）仍要原样上抛，否则配置错误会被静默成"请求失败"。这条边界有反向测试钉住（`TestUnexpectedNotFoundStillSurfaces`）。
 - **429 仍然透传**（pro.4 的决定不变），客户端能按 `Retry-After` 退避。**已知残余**：连续 429 仍可能触发 CPA 冷却——2026-09-30 的上传 429 就是帮凶之一；若再出现"429 → 503 墙"，下一步就是把最终失败的 429 也内联。
 - **已知边界**：非流式内联交付只在 `Format == openai-response` 生效（与 5xx 规则同一条件）；`codex` 格式的非流式路径仍会把上游错误交给 CPA。
+
+## 19. 第一批搬运：示例目录化、终态与失败分类（0.2.2-pro.7）
+
+上游 v0.2.6–v0.2.9 与 sub2api v2.9.2–v2.9.5 的逐条评估见工作区 `BORROW-eval-20260930-upstream-v0.2.6-v0.2.9.md`。本版搬五项：
+
+1. **中继示例按本轮目录生成**（`clientToolRelayExamples`）。旧实现把 `exec_command`（函数）与 `apply_patch`（custom 裸文本）两个示例**无条件**写进提示词；目录里没有该工具、或它被声明成另一种类型时，等于教模型发目录外的名字或错形状。现在只对目录内、类型匹配、且示例参数能过声明 schema（`schemaMatches`）的工具生成示例，并用完整限定名（`references` 的取值）。上游 v0.2.8 与 sub2api v2.9.5 是**各自独立**修这一处，所以我们把它列为最高优先级。
+   配套：`functionRelayEncoding`（函数载荷与外层 arguments 的两层 JSON）在协议说明、`transportRetryHint`、每轮提醒三处共用同一措辞。
+2. **`response.cancelled` 是终态**（增量桥 `handleEvent`）。缺它则事件被透传、流无终态结束；严格路径（`parseFinalStreamResponse`）本来就把它当失败处理。
+3. **失败分类纳入标识符**：`upstreamRequestError` 附 `upstream_code=`/`upstream_type=`；`isModelAccessDenial` 认这些标识符；`asUpstreamModelAccessError` 从仅 404 扩到 **403 模型访问/权限/配额类**。**401 不内联**——凭据过期是 CPA 该知道的事。**刻意不采纳**上游/sub2api"隐藏上游自由文本、只留标识符"的做法：我们保留真实原因（仅脱敏 token），这是排查线上问题的关键。
+4. **传输层失败内联交付**：`upstream_transport` / `attachment_transport`（502）与上游 5xx 同样按内联失败交付（`service.go` 两处交付点）；`invalid_upstream_response`、`invalid_config`、`model_metadata_missing` 等仍保持响亮——配置/协议错误该被发现。
+5. **合成流补 reasoning 摘要事件**：`syntheticStream` 现在为 `reasoning` 条目发 `response.reasoning_summary_part.added` / `_text.delta` / `_text.done` / `_part.done`，并在 `output_item.added` 里把 `summary` 置空；此前只有 `message` 与两类工具条目有事件序列。
+6. **附件引用只发最小形状 `{type, file_id}`**（⑮，采纳上游 v0.2.4 #17）：新增 `normalizeFileReferenceImages`（`attachments.go`），在**图片校验与上传之后**把所有 message 正文里的 `input_image` 引用收敛成恰好 `{type, file_id}`——不补齐也不保留 `detail`/`client_metadata` 等字段；上传回填同样只写这两个字段（不再补 `detail: "auto"`），回放的历史引用由收尾归一覆盖。内联 `data:`（含工具结果截图）与 HTTPS `image_url` 保持原样。
+   - **为什么翻案**：第 16 节记过"不采纳 #17"，反证是 2026-09-28 14:00 那次带 `detail:"high"` 的引用回的是 **500 归属校验**而不是 422。但"回了另一种错误"并不能证明"该字段被接受"；而 sub2api v2.9.5 **独立**实现了同一归一（`normalizeMessageFileImages`，README 把它写成契约：新上传/回放/从工具结果搬出的引用都只发 `type`+`file_id`，HTTPS 与内联截图保留 detail），两侧同向。那次 500 的请求形状（12 张图里有 2 张命中缓存被改写成带 `detail` 的引用）恰好落在 sub2api 要归一的形状里——"额外字段"与当时归因的"过期 file_id"两种解释并存，后者并未被 A/B 排除。
+   - **边界**：归一不掩盖畸形引用——非法 `detail`、`file_id` 与 `image_url` 混用仍在校验阶段本地 400（并保留带位置的诊断）；工具结果条目（上游以 422 拒绝其中的附件引用）不参与归一。测试钉在 `file_reference_shape_test.go`。
+
+**本版未搬（留档判据）**：上游 v0.2.9 的 `credential_source: host`（host 凭据模式，CPAv8.0.4 的 ABI 已确认可用，作为第二批单独做）、`stream_tool_mode: buffered`（我们已是"工具扣留 + 正文实时"，buffered 对我们是退步）、WS 相关全部（我们走 SSE）、以及 sub2api 的账号池/图床/常量重构。上游 v0.2.6 的推理摘要"被流式层过滤"不适用于我们（我们的桥对非工具事件原样透传）。

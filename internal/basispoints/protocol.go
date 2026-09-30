@@ -19,10 +19,15 @@ const (
 	transportAlias       = "functions.run_officejs"
 	itemIDPrefixFunction = "fc_"
 	itemIDPrefixCustom   = "ctc_"
-	transportRetryHint   = "The previous run_officejs relay was malformed. Retry once using exactly one client tool name in outer references and only its payload in code: a JSON arguments object for function tools, or unchanged raw input for custom tools. Do not wrap the payload in a tool/args object. Serialize the outer arguments once, including quotes and backslashes."
+	transportRetryHint   = "The previous run_officejs relay was malformed. Retry once using exactly one client tool name in outer references and only its payload in code: a JSON arguments object for function tools, or unchanged raw input for custom tools. Do not wrap the payload in a tool/args object. Serialize the outer arguments once, including quotes and backslashes. " + functionRelayEncoding
 	toolCatalogPrefix    = "This request is relayed by an external Responses API client, not by the live Excel workbook. The native run_officejs function is a transport endpoint owned by this proxy. The proxy intercepts it before execution, so it never runs Office code or changes the workbook."
 	toolCatalogReminder  = "Reminder: use the outer native run_officejs transport. Set references to an array containing exactly one catalog client tool name; put only that tool payload in code. Never put a tool/args wrapper in code or route to run_officejs or functions.run_officejs."
 )
+
+// functionRelayEncoding 是"函数工具的两层 JSON"说明：先序列化完整参数对象，再把该 JSON 文本作为外层
+// code 字符串、并序列化外层 arguments。协议说明、纠错提示与每轮提醒共用同一措辞，避免三处说法不一致
+// （对齐上游 v0.2.8 的 functionRelayEncoding）。
+const functionRelayEncoding = "For function tools, first JSON-serialize the complete arguments object, then use that JSON text as the outer code string and serialize the outer arguments object. These are two distinct JSON layers: preserve escaped quotes, backslashes, newlines and tabs in string arguments at both layers. The decoded code must itself parse as one JSON object. A function with a single patch, code, cmd or input field still requires the object wrapper named by its schema; raw patch or script text is only valid for a custom tool."
 
 // functionCodeMarkerPrefix 是"原始代码直传"的形态标记前缀（见 functionCodeMarker）。
 const functionCodeMarkerPrefix = "codex2api.function_code/"
@@ -184,25 +189,58 @@ func clientToolProtocolInstructions(source map[string]any) string {
 	if parallel, ok := source["parallel_tool_calls"].(bool); ok && !parallel {
 		catalogText += "\nInvoke at most one client tool in this response."
 	}
-	functionExample := string(jsonBytes(map[string]any{
-		"summary": "Run client tool exec_command", "extended_summary": "Relay a shell command through the external client",
-		"destructive": false, "references": []any{"exec_command"},
-		"code": string(jsonBytes(map[string]any{"cmd": `printf "hello"`})),
-	}))
-	customExample := string(jsonBytes(map[string]any{
-		"summary": "Run client tool apply_patch", "extended_summary": "Relay an unchanged patch through the external client",
-		"destructive": false, "references": []any{"apply_patch"},
-		"code": `*** Begin Patch
-*** Add File: hello.js
-+console.log("hello");
-*** End Patch`,
-	}))
 	codeToolHint := ""
 	if codeTools > 0 {
 		codeToolHint = " For a function tool whose catalog line says its code parameter carries source text, keep that source raw in code and put its other arguments as one JSON object in extended_summary."
 	}
-	return toolCatalogPrefix + " Other native server-injected Excel, Office, connector, workbook, list_skills, and web-search tools are unavailable. Never claim shell, filesystem, or workspace access is unavailable when the catalog contains a suitable tool. For repository inspection, invoke a suitable catalog shell tool through run_officejs. Set outer references to an array containing exactly one fully qualified client tool name from the catalog; references is the routing field, not a list of files or cells. Set outer code to only that tool's payload. For a function tool, code contains one JSON object of arguments. For a custom tool, code contains the exact raw input text, not JSON: preserve every quote, backslash, newline and space without another encoding layer. The proxy parses function arguments but does not parse custom input. Serialize the outer arguments object once. Do not put JavaScript wrappers, Markdown fences, a tool/args envelope, or another run_officejs call around the payload. Historical calls may contain the old tool/args envelope; do not copy that format into new calls. Example outer arguments for a function tool: " + functionExample + ". Example outer arguments for a custom tool: " + customExample + ". The proxy converts this native call into the real client tool call, then replays the original run_officejs identity with the client tool result on the next request. Interpret that result as the named client tool output. Never repeat a tool request whose output is already present. Available client tools:" + "\n" + catalogText + "\n" + toolCatalogReminder +
+	return toolCatalogPrefix + " Other native server-injected Excel, Office, connector, workbook, list_skills, and web-search tools are unavailable. Never claim shell, filesystem, or workspace access is unavailable when the catalog contains a suitable tool. For repository inspection, invoke a suitable catalog shell tool through run_officejs. Set outer references to an array containing exactly one fully qualified client tool name from the catalog; references is the routing field, not a list of files or cells. Set outer code to only that tool's payload. For a function tool, code contains one JSON object of arguments. " + functionRelayEncoding + " For a custom tool, code contains the exact raw input text, not JSON: preserve every quote, backslash, newline and space without another encoding layer. The proxy parses function arguments but does not parse custom input. Serialize the outer arguments object once. Do not put JavaScript wrappers, Markdown fences, a tool/args envelope, or another run_officejs call around the payload. Historical calls may contain the old tool/args envelope; do not copy that format into new calls." + clientToolRelayExamples(names, specs) + " The proxy converts this native call into the real client tool call, then replays the original run_officejs identity with the client tool result on the next request. Interpret that result as the named client tool output. Never repeat a tool request whose output is already present. Available client tools:" + "\n" + catalogText + "\n" + toolCatalogReminder +
 		" Use a separate outer native run_officejs call for each client tool invocation." + codeToolHint + " The available catalog is authoritative for tool names and arguments."
+}
+
+// clientToolRelayExamples 只为本轮目录里、类型匹配且示例参数能过声明 schema 的工具生成示例。
+// 上游 v0.2.8 与 sub2api v2.9.5 独立改用这一做法：不再把固定工具名（exec_command / apply_patch）
+// 与固定形态写进所有请求——目录里没有该工具、或该工具被声明成另一种类型时，固定示例会教模型
+// 发错名字或错形状（tool_not_in_catalog 422 / 参数 schema 不符）。
+func clientToolRelayExamples(names []string, specs map[string]toolSpec) string {
+	const patch = "*** Begin Patch\n*** Add File: hello.js\n+console.log(\"hello\");\n*** End Patch"
+	var examples strings.Builder
+	for _, name := range names {
+		spec := specs[name]
+		bare := strings.ToLower(strings.TrimSpace(spec.Name))
+		var arguments map[string]any
+		payload := ""
+		switch {
+		case bare == "exec_command" || strings.HasSuffix(bare, "_exec_command"):
+			if spec.Type != "function" {
+				continue
+			}
+			arguments = map[string]any{"cmd": "printf '%s\\n' \"hello\""}
+		case bare == "apply_patch" || strings.HasSuffix(bare, "_apply_patch"):
+			if spec.Type == "custom" {
+				payload = patch
+			} else {
+				arguments = map[string]any{"patch": patch}
+			}
+		default:
+			continue
+		}
+		if spec.Type == "function" {
+			schema := firstMap(spec.Spec, "parameters", "inputSchema", "input_schema")
+			if schema == nil || !schemaMatches(arguments, schema) {
+				continue
+			}
+			payload = string(jsonBytes(arguments))
+		}
+		outer := map[string]any{
+			"summary":          "Run client tool " + name,
+			"extended_summary": "Relay one client tool through the external client",
+			"destructive":      false,
+			"references":       []any{name},
+			"code":             payload,
+		}
+		examples.WriteString(" Example outer arguments for " + name + " (" + spec.Type + "): " + string(jsonBytes(outer)) + ".")
+	}
+	return examples.String()
 }
 
 func describeParameterNames(parameters map[string]any) string {
@@ -251,7 +289,7 @@ func clientToolProtocolReminder(source map[string]any) string {
 			}
 		}
 	}
-	reminder := toolCatalogReminder + " Do not merely say you will act; make the tool call. Client tools: " + strings.Join(names, ", ") + ". Other native tools are unavailable."
+	reminder := toolCatalogReminder + " " + functionRelayEncoding + " Do not merely say you will act; make the tool call. Client tools: " + strings.Join(names, ", ") + ". Other native tools are unavailable."
 	for name, spec := range specs {
 		if spec.Type == "custom" {
 			reminder += " Custom tool " + name + " takes raw input directly in code; do not JSON-encode that input."
@@ -1304,6 +1342,9 @@ func syntheticStream(response map[string]any) []byte {
 				added["status"] = "in_progress"
 				added["content"] = []any{}
 			}
+			if stringValue(item["type"]) == "reasoning" {
+				added["summary"] = []any{}
+			}
 			if field != "" {
 				added[field] = ""
 				if field == "arguments" {
@@ -1319,6 +1360,8 @@ func syntheticStream(response map[string]any) []byte {
 				emit(event+".done", map[string]any{"output_index": index, "item_id": item["id"], field: text})
 			} else if stringValue(item["type"]) == "message" {
 				emitMessageContent(emit, index, item)
+			} else if stringValue(item["type"]) == "reasoning" {
+				emitReasoningSummary(emit, index, item)
 			}
 			emit("response.output_item.done", map[string]any{"output_index": index, "item": item})
 		}
@@ -1330,6 +1373,27 @@ func syntheticStream(response map[string]any) []byte {
 	emit(terminalEvent, map[string]any{"response": response})
 	builder.WriteString("data: [DONE]\n\n")
 	return []byte(builder.String())
+}
+
+// emitReasoningSummary 回放推理条目的摘要事件（上游 v0.2.6 起合成流也补齐这段）。
+// 缺了它，客户端"思考"面板在"缓冲后回放成 SSE"的路径上会空白。
+func emitReasoningSummary(emit func(string, map[string]any), outputIndex int, item map[string]any) {
+	summary, _ := item["summary"].([]any)
+	for summaryIndex, value := range summary {
+		part := objectValue(value)
+		if part == nil || stringValue(part["type"]) != "summary_text" {
+			continue
+		}
+		added := cloneObject(part)
+		added["text"] = ""
+		emit("response.reasoning_summary_part.added", map[string]any{"output_index": outputIndex, "item_id": item["id"], "summary_index": summaryIndex, "part": added})
+		text, _ := part["text"].(string)
+		if text != "" {
+			emit("response.reasoning_summary_text.delta", map[string]any{"output_index": outputIndex, "item_id": item["id"], "summary_index": summaryIndex, "delta": text})
+		}
+		emit("response.reasoning_summary_text.done", map[string]any{"output_index": outputIndex, "item_id": item["id"], "summary_index": summaryIndex, "text": text})
+		emit("response.reasoning_summary_part.done", map[string]any{"output_index": outputIndex, "item_id": item["id"], "summary_index": summaryIndex, "part": part})
+	}
 }
 
 // 按原始 content 下标回放，不能因空正文或拒绝片段而压缩索引。
@@ -2061,7 +2125,7 @@ func (b *toolStreamBridge) handleEvent(event string, data []byte) error {
 		}
 	case "response.completed":
 		return b.completeResponse(payload)
-	case "response.failed", "response.incomplete", "error":
+	case "response.failed", "response.incomplete", "response.cancelled", "error":
 		stripToolItems(payload)
 		b.mu.Lock()
 		b.terminal = true

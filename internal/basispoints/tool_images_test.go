@@ -55,7 +55,7 @@ func TestToolOutputReferencesRelocateToAdjacentUserMessage(t *testing.T) {
 	if !strings.Contains(stringValue(objectValue(parts[1])["text"]), "[Tool output image 1 for call_id \"call-1\"]") {
 		t.Fatalf("follower label = %#v", parts[1])
 	}
-	if image := objectValue(parts[2]); image["file_id"] != "file-tool-1" || image["detail"] != "original" || image["image_url"] != nil {
+	if image := objectValue(parts[2]); image["file_id"] != "file-tool-1" || image["detail"] != nil || image["image_url"] != nil || len(image) != 2 {
 		t.Fatalf("relocated image = %#v", image)
 	}
 	// 第二个工具结果（HTTPS 引用）同样搬迁。
@@ -110,7 +110,7 @@ func TestMultipleToolImagesRelocateAlternating(t *testing.T) {
 	if !strings.Contains(stringValue(objectValue(parts[1])["text"]), "image 1") || objectValue(parts[2])["file_id"] != "file-a" {
 		t.Fatalf("first pair = %#v", parts[1:3])
 	}
-	if !strings.Contains(stringValue(objectValue(parts[3])["text"]), "image 2") || objectValue(parts[4])["file_id"] != "file-b" || objectValue(parts[4])["detail"] != "high" {
+	if !strings.Contains(stringValue(objectValue(parts[3])["text"]), "image 2") || objectValue(parts[4])["file_id"] != "file-b" || objectValue(parts[4])["detail"] != nil || len(objectValue(parts[4])) != 2 {
 		t.Fatalf("second pair = %#v", parts[3:5])
 	}
 }

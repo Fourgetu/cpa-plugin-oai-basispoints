@@ -81,21 +81,22 @@ func TestInlineImagePreflightRejectsBeforeAnyUpload(t *testing.T) {
 	}
 }
 
-func TestInlineImageDetailRetainedAndValidated(t *testing.T) {
+// detail 仍然校验（非法值本地 400 且不上传），但不再随附件引用上线：
+// file_id 只发 {type, file_id}（上游 v0.2.4 #17 与 sub2api v2.9.5 同向）。
+func TestInlineImageDetailValidatedThenReferenceMinimized(t *testing.T) {
 	dataURL, _ := testImageDataURL(t)
 	for _, tc := range []struct {
 		name   string
 		detail any
-		want   any
 		ok     bool
 	}{
-		{"missing", nil, "auto", true},
-		{"auto", "auto", "auto", true},
-		{"low", "low", "low", true},
-		{"high", "high", "high", true},
-		{"original", "original", "original", true},
-		{"invalid-enum", "ultra", nil, false},
-		{"non-string", 7, nil, false},
+		{"missing", nil, true},
+		{"auto", "auto", true},
+		{"low", "low", true},
+		{"high", "high", true},
+		{"original", "original", true},
+		{"invalid-enum", "ultra", false},
+		{"non-string", 7, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			part := imagePart(dataURL)
@@ -122,8 +123,8 @@ func TestInlineImageDetailRetainedAndValidated(t *testing.T) {
 				t.Fatal(err)
 			}
 			got := objectValue(objectValue(body["input"].([]any)[0])["content"].([]any)[0])
-			if got["detail"] != tc.want || got["file_id"] != "file-detail" || got["image_url"] != nil {
-				t.Fatalf("unexpected rewritten part: %#v", got)
+			if got["file_id"] != "file-detail" || got["image_url"] != nil || got["detail"] != nil || len(got) != 2 {
+				t.Fatalf("attachment reference must be minimal: %#v", got)
 			}
 		})
 	}

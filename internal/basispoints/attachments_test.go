@@ -146,8 +146,8 @@ func TestInlineImageUploadWireContract(t *testing.T) {
 				if len(parts) != 2 || received["reasoning_effort"] != "xhigh" || received["stream"] != stream {
 					t.Fatal("request content or settings changed")
 				}
-				for i, detail := range []string{"high", "auto"} {
-					if !reflect.DeepEqual(objectValue(parts[i]), map[string]any{"type": "input_image", "file_id": "file-uploaded", "detail": detail}) {
+				for i := 0; i < 2; i++ {
+					if !reflect.DeepEqual(objectValue(parts[i]), map[string]any{"type": "input_image", "file_id": "file-uploaded"}) {
 						t.Fatal("incorrect image reference")
 					}
 				}
@@ -313,8 +313,8 @@ func TestAttachmentCacheEvictsOldestAndDoesNotCacheFailures(t *testing.T) {
 }
 
 // 用户消息里的内联图片上传成附件引用；工具结果里的内联截图保留 data: 原样
-// （加载项原生形态，上传转附件引用会被上游以 422 拒绝）；既有的附件引用与
-// HTTPS URL、assistant 消息里的图片保持原样。
+// （加载项原生形态，上传转附件引用会被上游以 422 拒绝）；附件引用统一收敛成
+// {type, file_id}（normalizeFileReferenceImages）；HTTPS URL 与 assistant 消息里的图片保持原样。
 func TestImageUploadRewritesToolOutputsAndPreservesOtherInputKinds(t *testing.T) {
 	dataURL, _ := testImageDataURL(t)
 	source := map[string]any{"input": []any{
@@ -342,13 +342,13 @@ func TestImageUploadRewritesToolOutputsAndPreservesOtherInputKinds(t *testing.T)
 		t.Fatalf("item count changed: %d", len(items))
 	}
 	userParts := objectValue(items[0])["content"].([]any)
-	if objectValue(userParts[0])["file_id"] != "file-existing" || objectValue(userParts[0])["detail"] != "high" {
-		t.Fatal("existing file ID or detail was modified")
+	if !reflect.DeepEqual(objectValue(userParts[0]), map[string]any{"type": "input_image", "file_id": "file-existing"}) {
+		t.Fatal("existing file ID reference was not normalized to type+file_id")
 	}
 	if objectValue(userParts[1])["image_url"] != "https://example.test/image.png" {
 		t.Fatal("remote URL was modified")
 	}
-	if uploaded := objectValue(userParts[2]); uploaded["file_id"] != "file-uploaded" || uploaded["image_url"] != nil || uploaded["detail"] != "auto" {
+	if uploaded := objectValue(userParts[2]); uploaded["file_id"] != "file-uploaded" || uploaded["image_url"] != nil || uploaded["detail"] != nil {
 		t.Fatalf("user inline image not uploaded: %#v", uploaded)
 	}
 	for i, detail := range []any{nil, "low"} {

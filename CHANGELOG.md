@@ -1,5 +1,14 @@
 # 更新日志
 
+## v0.2.2-pro.6 — 2026-09-30（fork，未发布）
+
+**上游 404"模型不可用"不再让 CPA 冷却唯一凭据**（对应 2026-09-30 线上事故：`gpt-6-astra-basispoints` 被上游持续 404，CPA 冷却后整个别名 503 `auth_unavailable`，实测 10 分钟不自愈，只能重启）：
+
+- 新增 `asUpstreamModelAccessError` / `isModelAccessDenial`（`types.go`）：上游 **404** + 错误类别 `upstream_error`/`attachment_upload_error` + 文案命中"模型不存在/无访问权/模型访问已变更"（`does not exist or you do not have access`、`model_not_found`、`model access has changed`）时，与既有 5xx 规则一样按**内联失败交付**——流式 `response.failed`、非流式 `status=failed`，均 HTTP 200，客户端立刻拿到明确终态，其它模型/请求不受影响。
+- 交付点与 5xx 相同（`service.go` 的非流式 `executor.execute` 与流式 `executeStreamIncremental`），错误码用 **`upstream_model_unavailable`** 与 5xx 的 `upstream_server_error` 区分。
+- **刻意保留**：与模型访问无关的 404（例如 `responses_url` 配错、路径写错）**仍原样交给 CPA**，让配置错误保持响亮；429 也仍透传（保持"客户端按 `Retry-After` 退避"）。
+- 测试：新增 `model_access_test.go`（文案识别正反表、404 分类正反表、流式内联交付且**上游只被调用 1 次**、非流式内联交付、无关 404 仍抛错）。
+
 ## v0.2.2-pro.5 — 2026-09-28（fork，未发布）
 
 搬运上游 v0.2.4 与 sub2api v2.8.20 的三处修复（都只影响图片与诊断，不改交付语义）：

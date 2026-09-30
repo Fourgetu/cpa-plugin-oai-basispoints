@@ -176,6 +176,12 @@ func (s *Service) execute(raw json.RawMessage, stream bool) (any, error) {
 					"Headers": http.Header{"Content-Type": {"application/json"}},
 				}, nil
 			}
+			if accessErr, ok := asUpstreamModelAccessError(err); ok {
+				return map[string]any{
+					"Payload": failureResponseBody("", "upstream_model_unavailable", accessErr.Message),
+					"Headers": http.Header{"Content-Type": {"application/json"}},
+				}, nil
+			}
 		}
 		return nil, err
 	}
@@ -365,6 +371,15 @@ func (s *Service) executeStreamIncremental(request ExecutorRequest, body map[str
 		// 唯一的凭据冷却成 503 墙（同一账号的其它客户端一起断），客户端看到失败终态可立即重试。
 		if upstreamErr, ok := asUpstreamServerError(err); ok {
 			payload := map[string]any{"stream_id": request.StreamID, "payload": syntheticFailureStream(nil, "", "upstream_server_error", upstreamErr.Message)}
+			if emitErr := s.call("host.stream.emit", payload, nil); emitErr == nil {
+				_ = s.call("host.stream.close", map[string]any{"stream_id": request.StreamID}, nil)
+				return map[string]any{"Headers": map[string][]string{"Content-Type": {"text/event-stream"}, "Cache-Control": {"no-cache"}}}, nil
+			}
+		}
+		// 上游 404"模型不存在/无访问权"同 5xx 一样按内联失败交付：重试与冷却都无意义，而且交给 CPA
+		// 会把这套（单凭据插件的唯一）凭据冷却成持续的 503 auth_unavailable（2026-09-30 实测复现）。
+		if accessErr, ok := asUpstreamModelAccessError(err); ok {
+			payload := map[string]any{"stream_id": request.StreamID, "payload": syntheticFailureStream(nil, "", "upstream_model_unavailable", accessErr.Message)}
 			if emitErr := s.call("host.stream.emit", payload, nil); emitErr == nil {
 				_ = s.call("host.stream.close", map[string]any{"stream_id": request.StreamID}, nil)
 				return map[string]any{"Headers": map[string][]string{"Content-Type": {"text/event-stream"}, "Cache-Control": {"no-cache"}}}, nil

@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	Version        = "0.2.2-pro.5"
+	Version        = "0.2.2-pro.6"
 	Provider       = "oai-basispoints"
 	AuthProviderID = "codex"
 	PluginID       = Provider
@@ -60,6 +60,43 @@ func asUpstreamServerError(err error) (*APIError, bool) {
 		return apiError, true
 	}
 	return nil, false
+}
+
+// asUpstreamModelAccessError 判断错误是不是"上游拒绝该模型/账号"的 404。
+// 2026-09-30 实测：上游对某个模型回 404（`The model \`…\` does not exist or you do not have access to it.`，
+// 其内部还会把模型名贴上 `degrade2-luna` / `codex-abuse` 一类标签），CPA 收到后会把这套（单凭据插件的
+// 唯一）凭据冷却成持续的 503 `auth_unavailable`，且不会自愈——只能重启 CPA。这类错误重试与冷却都无意义，
+// 因此与上游 5xx 同样在服务层按内联失败交付：客户端立刻拿到明确终态，其它模型/请求不受影响。
+func asUpstreamModelAccessError(err error) (*APIError, bool) {
+	var apiError *APIError
+	if !errors.As(err, &apiError) || apiError == nil || apiError.Status != 404 {
+		return nil, false
+	}
+	switch apiError.Kind {
+	case "upstream_error", "attachment_upload_error":
+	default:
+		return nil, false
+	}
+	if !isModelAccessDenial(apiError.Message) {
+		return nil, false
+	}
+	return apiError, true
+}
+
+// isModelAccessDenial 识别上游"模型不存在 / 无访问权 / 模型访问已变更"的文案。
+// 只认这几条：其它 404（例如 responses_url 配错、路径写错）仍原样交给 CPA，保持配置错误足够响亮。
+func isModelAccessDenial(message string) bool {
+	lowered := strings.ToLower(message)
+	for _, marker := range []string{
+		"does not exist or you do not have access",
+		"model_not_found",
+		"model access has changed",
+	} {
+		if strings.Contains(lowered, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // protocolFailureCode 给内联失败选错误码（协议错误自身带的类别优先）。

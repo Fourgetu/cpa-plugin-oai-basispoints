@@ -1,6 +1,6 @@
 # CPA OpenAI Basis Points 插件
 
-> 本仓库是 [Fourgetu](https://github.com/Fourgetu) 的 fork：代码基线为上游 v0.1.14，版本号 `0.2.2-pro.5`（从 0.2.2-pro.1 起跟随上游版本线：0.2.2-pro.N = 对齐上游 v0.2.2 时点的修复集，不含上游 v0.1.18 streaming 重写与 v0.2.0 WS 传输）。相对上游的改动、分流条件与取舍见 [FORK-NOTES.md](FORK-NOTES.md)，更新日志见 [CHANGELOG.md](CHANGELOG.md)。上游代码、MIT 许可证与版权声明原样保留。
+> 本仓库是 [Fourgetu](https://github.com/Fourgetu) 的 fork：代码基线为上游 v0.1.14，版本号 `0.2.2-pro.6`（从 0.2.2-pro.1 起跟随上游版本线：0.2.2-pro.N = 对齐上游 v0.2.2 时点的修复集，不含上游 v0.1.18 streaming 重写与 v0.2.0 WS 传输）。相对上游的改动、分流条件与取舍见 [FORK-NOTES.md](FORK-NOTES.md)，更新日志见 [CHANGELOG.md](CHANGELOG.md)。上游代码、MIT 许可证与版权声明原样保留。
 这是一个 CLIProxyAPI（CPA）原生插件，用 CPA 已有的 ChatGPT/Codex OAuth 凭据直接请求。
 
 ## 通过 CPA 插件商店安装（推荐）
@@ -47,6 +47,7 @@ plugins:
 | 15 | 图片张数上限改为可配置 `max_request_inline_images`（integer，默认 512，范围 1–4096），体积/像素三道闸门（单图 20 MiB / 累计 32 MiB / 64 MP）保持固定 | 旧值 20 是从 sub2api 继承的准入护栏、不是上游硬限制（上游官方插件没有任何张数/体积限制）；Codex 每轮重发全量历史、工具截图逐轮累积，第 21 张起永久 400 把长会话锁死（实测触发请求 285 条目、21 张图、总体积仅 1.27 MiB） |
 | 16 | 限速与上游 5xx 的鲁棒性：429/503/500/502/504 有界退避重试（读 `Retry-After`，上限 8s）；上游 5xx 改按内联失败交付（`response.failed` / `status=failed`，HTTP 200）不再让 CPA 冷却唯一凭据；附件缓存去掉 `access_token` 键、加 15 分钟有效期、容量可配（`max_attachment_cache_entries`） | 2026-09-28 实测：附件上传 429 会把客户端拖进"整轮重试→重传所有图片"；账号级 1000 次/分钟 429 与我们无关（我们只有 1–3 请求/分钟，同账号网页端在共用配额）；上游 500（复用过期 `file_id`）会以 5xx 交给 CPA → 凭据冷却 → 连打 9 次 503 |
 | 17 | 图片上传按**字节签名**定文件名与 Content-Type（PNG/JPEG/GIF/WebP 白名单，删掉 `mime.ExtensionsByType`）；图片类错误带位置，上游图片错误追加 `image_refs`（只给位置与类型）；429 最终失败时把 `Retry-After` 以 `retry_after=Ns` 附到错误正文 | 旧实现取 `ExtensionsByType(mediaType)[0]`：`image/jpeg` → `.jfif`（有 `/etc/mime.types` 的环境）、`image/jpg` → 空后缀，两者都不在上游白名单（`.jpeg .jpg .png .gif .webp`）里，会让整条请求被 400 `Invalid input: Expected image type to be a supported format`；CPA 容器里没有 mime.types 才一直侥幸取到 `.jpeg` |
+| 18 | 上游 404"模型不存在/无访问权"按内联失败交付（错误码 `upstream_model_unavailable`），不再让 CPA 冷却唯一凭据 | 2026-09-30 实测：上游对某个模型持续 404（错误里模型名被上游贴上 `degrade2-luna` / `codex-abuse` 一类标签），CPA 冷却后该别名每次立即 503 `auth_unavailable` 且 10 分钟不自愈、只能重启 CPA，同账号其它客户端一起断；与模型访问无关的 404 仍照旧上抛，配置错误不会被静默 |
 
 此外还有两处收紧，属于本分支对放行策略的加固：
 

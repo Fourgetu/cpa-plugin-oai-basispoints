@@ -274,3 +274,13 @@ docker run --rm -v "$PWD":/src -w /src golang:1.26 sh -c '
 4. Codex 侧发布说明提到协作条目改用原生 `agent_message`（不再走文本协议）。
 
 **回退动作（届时执行，等于对齐上游 v0.2.5）**：`translateInputItems` 不再调用 `normalizeHistoryMessage`——`author`/`recipient` 与 `agent_message` 一律原样透传、缺失字段不伪造、畸形内容不修；测试照搬上游 `agent_message_routing_test.go` 的用例形态（我们只搬 HTTP 版：WS 版依赖 `gorilla/websocket` 与 WS 传输，本分支没有）；同步改写 `history_messages_test.go` 的 P0-C 用例，以及本节、第 12 节、README 差异表第 14 行、CHANGELOG 的 pro.2 条目。
+
+## 18. 上游 404"模型不可用"按内联失败交付（0.2.2-pro.6）
+
+事故（2026-09-30，完整证据链见工作区 `INCIDENT-20260930-auth-unavailable-cooldown.md`）：上游对 `gpt-6-astra` 持续回 `404 The model \`gpt-6-astra-degrade2-luna-1p-codexswic-ev3\` does not exist or you do not have access to it.`。标签是**上游加的**：`config.yaml`、CPA v8.0.4 二进制（`codexswic`/`codex-abuse`/`degrade2` 各 0 命中）、我们的 `.so` 里都没有那些 token，日志里也只出现在上游错误文本中。CPA 收到 404 后把这套（单凭据插件的唯一）凭据冷却，该别名随后**每次立即 503 `auth_unavailable`，实测 10 分钟不自愈**（只能重启 CPA），而同一时刻其它模型全绿。
+
+本版：`asUpstreamModelAccessError`（`types.go`）+ 两处交付点（`service.go`）——**404 + `upstream_error`/`attachment_upload_error` + 模型访问类文案**（`does not exist or you do not have access` / `model_not_found` / `model access has changed`）与既有 5xx 规则一样按内联失败交付，错误码 `upstream_model_unavailable`。
+
+- 为什么不是"一律内联所有 4xx"：与模型访问无关的 404（`responses_url` 配错、路径写错等）仍要原样上抛，否则配置错误会被静默成"请求失败"。这条边界有反向测试钉住（`TestUnexpectedNotFoundStillSurfaces`）。
+- **429 仍然透传**（pro.4 的决定不变），客户端能按 `Retry-After` 退避。**已知残余**：连续 429 仍可能触发 CPA 冷却——2026-09-30 的上传 429 就是帮凶之一；若再出现"429 → 503 墙"，下一步就是把最终失败的 429 也内联。
+- **已知边界**：非流式内联交付只在 `Format == openai-response` 生效（与 5xx 规则同一条件）；`codex` 格式的非流式路径仍会把上游错误交给 CPA。
